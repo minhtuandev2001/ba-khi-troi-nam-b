@@ -1,4 +1,4 @@
-# Sinh Tồn 2D: Backend
+# Bá Khí - Trời Nam 2D: Backend
 
 Máy chủ cho game battle royale 2D: REST API (tài khoản, hồ sơ, thống kê, lịch sử) và Socket.IO (ghép trận, phòng, mô phỏng trận đấu). Server có toàn quyền quyết định kết quả, tick 30 Hz, gửi trạng thái 15 Hz.
 

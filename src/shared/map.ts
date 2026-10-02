@@ -28,8 +28,13 @@ export interface GameMap {
   decor: Decor[];
 }
 
-const FLOORS = [0xe0b07a, 0xd49a62, 0xe8c48e, 0xc99a6a];
-const ROOFS = [0xe8553e, 0x2fa3e0, 0xf2a530, 0x3fbf8f, 0x9b6bd6];
+// colours are render-only; keep each list's length so the seeded layout never changes
+/** Bamboo-slat floors. */
+const FLOORS = [0xd8b47a, 0xc9a064, 0xe2c28a, 0xbf9660];
+/** Thatch tints: fresh straw, old straw, rice stalk, dried palm leaf, sun-bleached. */
+const ROOFS = [0xe0b85a, 0xc0904a, 0xd2ae68, 0xa4804a, 0xe8cf8a];
+/** Ground patches: young rice, dark grass, dry grass, red earth. */
+const DECOR = [0xb8c470, 0x6f8a38, 0xd2c47a, 0xb88a52];
 
 const LAYOUTS: [number, number][] = [
   [1, 1], [2, 1], [1, 2], [2, 2], [3, 1], [2, 2],
@@ -50,7 +55,7 @@ export function generateMap(seed: number): GameMap {
       x: rng() * MAP_SIZE,
       y: rng() * MAP_SIZE,
       r: randRange(80, 260, rng),
-      color: pick(rng, [0x9be35f, 0x6cc23e, 0xb8e36a, 0xf0d58a]),
+      color: pick(rng, DECOR),
     });
   }
 
