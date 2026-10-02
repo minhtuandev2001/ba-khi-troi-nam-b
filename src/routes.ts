@@ -35,6 +35,10 @@ const registerSchema = credentialsSchema.extend({
 export function createApiRouter(game: GameServer): Router {
   const router = Router();
 
+  router.get('/healthy', (_req, res) => {
+    res.type('text/plain').send('ok');
+  });
+
   router.post('/auth/register', authLimiter, async (req, res) => {
     const parsed = registerSchema.safeParse(req.body);
     if (!parsed.success) {
