@@ -19,6 +19,7 @@ import {
   PLAYER_RADIUS,
   SCOPE_LEVELS,
   SNAPSHOT_EVERY_TICKS,
+  HUMAN_SPAWN_DISTANCE,
   SPAWN_MIN_DISTANCE,
   THROWABLE,
   TICK_MS,
@@ -337,29 +338,36 @@ export class Match {
   }
 
   private spawnPlayers() {
-    const placed: { x: number; y: number }[] = [];
-    for (const p of this.players) {
+    const placed: { x: number; y: number; human: boolean }[] = [];
+    // humans first so they get the widest choice of quiet spots
+    const order = [...this.players].sort((a, b) => Number(!a.userId) - Number(!b.userId));
+    for (const p of order) {
+      const human = !!p.userId;
       let best = { x: MAP_SIZE / 2, y: MAP_SIZE / 2 };
-      let bestScore = -1;
-      for (let i = 0; i < 300; i++) {
+      let bestScore = -Infinity;
+      for (let i = 0; i < 400; i++) {
         const x = 200 + this.rng() * (MAP_SIZE - 400);
         const y = 200 + this.rng() * (MAP_SIZE - 400);
         if (this.world.overlapsCircle(x, y, PLAYER_RADIUS + 12) || this.insideHouse(x, y, 30)) continue;
-        const nearest = placed.reduce((m, q) => Math.min(m, Math.hypot(q.x - x, q.y - y)), Infinity);
-        if (nearest >= SPAWN_MIN_DISTANCE) {
+        // score = how far past its required distance the closest neighbour is
+        let score = Infinity;
+        for (const q of placed) {
+          const need = human || q.human ? HUMAN_SPAWN_DISTANCE : SPAWN_MIN_DISTANCE;
+          score = Math.min(score, Math.hypot(q.x - x, q.y - y) - need);
+        }
+        if (score >= 0) {
           best = { x, y };
-          bestScore = Infinity;
           break;
         }
-        if (nearest > bestScore) {
-          bestScore = nearest;
+        if (score > bestScore) {
+          bestScore = score;
           best = { x, y };
         }
       }
       p.x = best.x;
       p.y = best.y;
       p.a = this.rng() * Math.PI * 2;
-      placed.push(best);
+      placed.push({ ...best, human });
     }
   }
 
@@ -411,6 +419,9 @@ export class Match {
     p.left = false;
     p.knownLoot.clear();
     p.inputQueue = [];
+    // a reconnecting client starts a fresh GameSession whose input sequence restarts at 1
+    p.lastSeq = 0;
+    p.inputTokens = 3;
     p.events = [];
     socket.emit('match:start', this.startMsg(pid));
     if (!p.alive) socket.emit('match:dead', this.deathMsg(p));

@@ -16,6 +16,10 @@ export const PLAYER_SPEED = 230;
 export const MAX_HP = 200;
 export const HEAL_MOVE_MULTIPLIER = 0.5;
 export const SPAWN_MIN_DISTANCE = 450;
+/** Minimum spawn gap between a human and anyone else, so nobody is shot in the first seconds. */
+export const HUMAN_SPAWN_DISTANCE = 950;
+/** Bots ignore human players at the start of a match unless a human shoots them first. */
+export const BOT_HUMAN_GRACE_MS = 15000;
 
 export const INTERACT_RANGE = 90;
 export const PICKUP_RANGE = 75;

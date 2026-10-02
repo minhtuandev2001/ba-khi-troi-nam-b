@@ -1,5 +1,6 @@
 import {
   BAG_CAPACITY,
+  BOT_HUMAN_GRACE_MS,
   INTERACT_RANGE,
   ITEMS,
   MAX_HP,
@@ -178,6 +179,8 @@ export class Bot {
     let bestD = Infinity;
     for (const o of m.players) {
       if (o === p || !o.alive || !m.canSee(p, o)) continue;
+      const provoked = recentlyHurt && o.pid === this.lastAttacker;
+      if (o.userId && now < BOT_HUMAN_GRACE_MS && !provoked) continue;
       let d = Math.hypot(o.x - p.x, o.y - p.y);
       if (!hasGun && d > 220 && !(recentlyHurt && o.pid === this.lastAttacker)) continue;
       if (o.pid === this.lastAttacker && recentlyHurt) d *= 0.5;

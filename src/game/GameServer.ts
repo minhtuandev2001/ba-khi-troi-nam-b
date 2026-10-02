@@ -42,6 +42,8 @@ interface PrivateRoom {
   profiles: Map<string, PublicUser>;
 }
 
+const RECONNECT_GRACE_MS = 60_000;
+
 interface QueueEntry {
   userId: string;
   joinedAt: number;
@@ -54,6 +56,7 @@ export class GameServer {
   private queue: QueueEntry[] = [];
   private readonly rooms = new Map<string, PrivateRoom>();
   private readonly userRoom = new Map<string, string>();
+  private readonly pendingLeave = new Map<string, NodeJS.Timeout>();
 
   constructor(private readonly io: Server) {
     io.use(async (socket, next) => {
@@ -166,18 +169,50 @@ export class GameServer {
     socket.on('disconnect', () => {
       if (this.online.get(user.id)?.socket !== socket) return;
       this.online.delete(user.id);
-      this.leaveQueue(user.id, false);
-      this.leaveRoom(user.id);
+      // phones drop the socket when the user switches app (e.g. to send the invite link), so keep their place for a while
+      this.cancelLeave(user.id);
+      this.pendingLeave.set(
+        user.id,
+        setTimeout(() => {
+          this.pendingLeave.delete(user.id);
+          if (this.online.has(user.id)) return;
+          this.leaveQueue(user.id, false);
+          this.leaveRoom(user.id);
+        }, RECONNECT_GRACE_MS),
+      );
       const m = this.userMatch.get(user.id);
       if (m && !m.ended) m.detachSocket(m.pidOfUser(user.id));
     });
 
+    this.cancelLeave(user.id);
     const match = this.userMatch.get(user.id);
     if (match && !match.ended) {
       match.attachSocket(match.pidOfUser(user.id), socket);
     } else {
       socket.emit('lobby:ready');
+      this.resyncLobby(user.id, socket);
     }
+  }
+
+  private cancelLeave(userId: string) {
+    const t = this.pendingLeave.get(userId);
+    if (t) clearTimeout(t);
+    this.pendingLeave.delete(userId);
+  }
+
+  /** Tells a (re)connected client whether it still has a room or queue place. */
+  private resyncLobby(userId: string, socket: Socket) {
+    const roomId = this.userRoom.get(userId);
+    const room = roomId ? this.rooms.get(roomId) : undefined;
+    if (room) {
+      const o = this.online.get(userId);
+      if (o) room.profiles.set(userId, o.user);
+      socket.emit('room:state', this.roomState(room));
+    } else {
+      socket.emit('room:closed', { reason: 'gone' });
+    }
+    if (this.queue.some((q) => q.userId === userId)) this.sendQueueStatus();
+    else socket.emit('queue:status', { inQueue: false, count: this.queue.length, needed: MAX_PLAYERS, waitedMs: 0, notice: false } satisfies QueueStatusMsg);
   }
 
   private emitError(userId: string, text: string) {
