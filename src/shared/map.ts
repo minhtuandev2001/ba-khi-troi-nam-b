@@ -193,6 +193,21 @@ function buildHouse(map: GameMap, rng: Rng, rect: Rect, cols: number, rows: numb
   }
 }
 
+/** Unit vector pointing out of the house for doors in an exterior wall, null for doors between rooms. */
+export function doorOutward(map: GameMap, d: Door): { dx: number; dy: number } | null {
+  const h = map.houses[d.houseId];
+  const cx = d.x + d.w / 2;
+  const cy = d.y + d.h / 2;
+  if (d.vertical) {
+    if (Math.abs(cx - h.x) < WALL_THICKNESS) return { dx: -1, dy: 0 };
+    if (Math.abs(cx - (h.x + h.w)) < WALL_THICKNESS) return { dx: 1, dy: 0 };
+  } else {
+    if (Math.abs(cy - h.y) < WALL_THICKNESS) return { dx: 0, dy: -1 };
+    if (Math.abs(cy - (h.y + h.h)) < WALL_THICKNESS) return { dx: 0, dy: 1 };
+  }
+  return null;
+}
+
 /** Room containing the point, or -1 when outdoors. */
 export function roomAt(map: GameMap, x: number, y: number): number {
   for (const house of map.houses) {

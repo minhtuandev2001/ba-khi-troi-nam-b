@@ -733,7 +733,7 @@ export class Match {
         const level = scopeOfItem(loot.item) as ScopeLevel;
         if (p.scopes.has(level)) return notice('Bạn đã có ống nhắm này.'), false;
         p.scopes.add(level);
-        if (level > p.scope) p.scope = level;
+        p.scope = level;
         take();
         return true;
       }
