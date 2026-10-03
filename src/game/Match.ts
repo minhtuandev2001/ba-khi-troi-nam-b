@@ -3,6 +3,7 @@ import {
   AIRDROP_ANNOUNCE_MS,
   AIRDROP_INTERVAL_MS,
   AIRDROP_SIZE,
+  AMMO_NAMES,
   AMMO_PICKUP_AMOUNT,
   ARMOR,
   BAG_CAPACITY,
@@ -12,7 +13,7 @@ import {
   GROUND_LOOT_TABLE,
   INTERACT_RANGE,
   ITEMS,
-  MAP_SIZE,
+  MAP_DEFS,
   MAX_HP,
   MEDKIT,
   PICKUP_RANGE,
@@ -37,6 +38,7 @@ import {
   pickWeighted,
   playerSpeed,
   rectContains,
+  resolveMapChoice,
   roomAt,
   scopeOfItem,
   segmentCircle,
@@ -58,7 +60,9 @@ import {
   type InputMsg,
   type ItemId,
   type LeaderboardEntry,
+  type LiveMatchSummary,
   type LootNet,
+  type MapId,
   type MatchEndMsg,
   type MatchStartMsg,
   type PlayerNet,
@@ -72,8 +76,27 @@ import {
   type ZoneState,
   AMMO_TYPES,
   xpForMatch,
+  BOAR_HP,
+  BOAR_RADIUS,
+  BOAR_RESPAWN_MS,
+  LANE_Y0,
+  LANE_Y1,
+  RACK_ITEMS,
+  RACK_RESPAWN_MS,
+  RACK_STEP,
+  RACK_X,
+  RACK_Y0,
+  TRAINING_KIT,
+  TRAINING_LANES,
+  TRAINING_SPAWN,
+  laneX,
+  type BoarNet,
+  type MarkerNet,
+  type TeammateNet,
+  type TrainingStatsNet,
 } from '../shared';
 import { Bot } from './Bot';
+import { NavGrid } from './NavGrid';
 
 export interface Participant {
   userId: string | null;
@@ -81,6 +104,9 @@ export interface Participant {
   avatar: string;
   level: number;
   isBot: boolean;
+  /** Players sharing a team never damage each other and are ranked together; defaults to one team per player. */
+  team?: number;
+  admin?: boolean;
 }
 
 export interface WeaponSlot {
@@ -90,6 +116,7 @@ export interface WeaponSlot {
 
 export interface Player extends Participant {
   pid: number;
+  team: number;
   socket: Socket | null;
   connected: boolean;
   left: boolean;
@@ -128,14 +155,22 @@ export interface Player extends Participant {
   inputQueue: InputMsg[];
   lastSeq: number;
   inputTokens: number;
+  /** Match time of the last move, shot or action; practice sessions left idle too long are closed. */
+  lastActiveAt: number;
   nextFireAt: number;
   reloadUntil: number;
   reloadSlot: SlotName | null;
   healUntil: number;
+  /** When the grenade in hand goes off: the pin is pulled as soon as it is equipped, 0 when not holding one. */
+  grenadeFuseAt: number;
   room: number;
   knownLoot: Set<number>;
   events: GameEvent[];
   spectating: number;
+  /** Walking over ammo, medkits, throwables and scopes picks them up; players opt in from their settings, bots always do. */
+  autoPickup: boolean;
+  /** The player's map marker, seen by them and their team. */
+  marker: { x: number; y: number } | null;
   bot: Bot | null;
 }
 
@@ -191,6 +226,26 @@ interface Airdrop {
   landAt: number;
 }
 
+interface Boar {
+  id: number;
+  lane: number;
+  x: number;
+  y: number;
+  dir: 1 | -1;
+  speed: number;
+  hp: number;
+  deadUntil: number;
+  pauseUntil: number;
+  nextChange: number;
+}
+
+interface RackSpot {
+  item: ItemId;
+  y: number;
+  lootId: number;
+  respawnAt: number;
+}
+
 export interface MatchResultPlayer {
   userId: string;
   placement: number;
@@ -200,16 +255,32 @@ export interface MatchResultPlayer {
   xpGained: number;
 }
 
+/** An admin watching the match through one player's eyes; nothing they send reaches the simulation. */
+interface Observer {
+  socket: Socket;
+  watching: number;
+  knownLoot: Set<number>;
+  events: GameEvent[];
+}
+
 export interface MatchCallbacks {
   onEnd(match: Match, players: MatchResultPlayer[], winnerName: string): void;
 }
 
 const TICK_S = TICK_MS / 1000;
 const SWAP_DELAY_MS = 250;
+const OUTDOOR_LOOT_MIN = 160;
+const OUTDOOR_LOOT_PER_PLAYER = 7;
+const SPAWN_CANDIDATES = 30;
+/** A training session with nobody connected is closed after this long. */
+const TRAINING_AWAY_MS = 60_000;
+/** A training session whose player stays connected without doing anything is closed after this long. */
+export const TRAINING_IDLE_MS = 10 * 60_000;
 
 export class Match {
   readonly map: GameMap;
   readonly world: CollisionWorld;
+  readonly nav: NavGrid;
   readonly players: Player[] = [];
   readonly loot = new Map<number, Loot>();
   readonly smokes: Smoke[] = [];
@@ -232,22 +303,48 @@ export class Match {
   private lastRealTime = performance.now();
   private pendingDeaths: Player[] = [];
   private timer: NodeJS.Timeout;
+  private readonly training: boolean;
+  private boars: Boar[] = [];
+  private racks: RackSpot[] = [];
+  private trainingStats: TrainingStatsNet = { shots: 0, hits: 0, kills: 0, best: 0, last: 0 };
+  private awaySince = -1;
+  /** Teams at the start of the match (the player count in solo matches). */
+  readonly teamCount: number;
+  /** Time left in the pre-match waiting area; the match clock (`now`) stays at 0 until it closes. */
+  private lobbyLeft: number;
+  lobbyArea: ZoneCircle | null = null;
+  private readonly initialDoors: boolean[];
+  /** Shown in the admin's live match list: the room's name for friend rooms. */
+  title = '';
+  /** Admins watching without taking part, by user id. */
+  private readonly observers = new Map<string, Observer>();
 
   constructor(
     readonly id: string,
     readonly mode: GameMode,
     participants: Participant[],
     private readonly callbacks: MatchCallbacks,
+    readonly mapId: MapId = resolveMapChoice('random', participants.length),
+    /** Multiplies every bot's movement speed (bot difficulty). */
+    private readonly botSpeed = 1,
+    readonly teamSize = 1,
+    lobbyMs = 0,
   ) {
     this.seed = Math.floor(Math.random() * 2 ** 31);
-    this.map = generateMap(this.seed);
+    this.training = mode === 'training';
+    this.map = generateMap(mapId);
     this.world = new CollisionWorld(this.map);
+    this.initialDoors = [...this.world.doorOpen];
+    this.nav = NavGrid.for(this.map);
     this.chestHp = this.map.chests.map(() => CHEST_HP);
     this.zoneCircles = this.buildZoneCircles();
     this.zone = zoneAt(this.zoneCircles, 0);
 
     participants.forEach((part, pid) => this.players.push(this.createPlayer(part, pid)));
-    this.spawnPlayers();
+    this.teamCount = new Set(this.players.map((p) => p.team)).size;
+    this.lobbyLeft = this.training ? 0 : lobbyMs;
+    if (this.lobbyLeft > 0) this.spawnInLobby();
+    else this.spawnPlayers();
     this.spawnInitialLoot();
 
     this.timer = setInterval(() => this.loop(), TICK_MS);
@@ -263,12 +360,35 @@ export class Match {
     return n;
   }
 
+  get aliveTeams(): number {
+    const teams = new Set<number>();
+    for (const p of this.players) if (p.alive) teams.add(p.team);
+    return teams.size;
+  }
+
+  get isTeamMatch(): boolean {
+    return this.teamSize > 1;
+  }
+
+  get inLobby(): boolean {
+    return this.lobbyLeft > 0;
+  }
+
+  private teamAlive(team: number): boolean {
+    return this.players.some((p) => p.alive && p.team === team);
+  }
+
+  private aliveMate(p: Player): Player | undefined {
+    return this.players.find((o) => o !== p && o.alive && o.team === p.team);
+  }
+
   // ---------------------------------------------------------------- setup
 
   private createPlayer(part: Participant, pid: number): Player {
     const p: Player = {
       ...part,
       pid,
+      team: part.team ?? pid,
       socket: null,
       connected: part.isBot,
       left: false,
@@ -282,12 +402,14 @@ export class Match {
       med: 0, gren: 0, smoke: 0,
       alive: true, deathTime: 0, placement: 0, kills: 0, damage: 0, killer: -1, killWeapon: '',
       mx: 0, my: 0, fire: false, prevFire: false, td: 200, moving: false,
-      inputQueue: [], lastSeq: 0, inputTokens: 3,
-      nextFireAt: 0, reloadUntil: 0, reloadSlot: null, healUntil: 0,
+      inputQueue: [], lastSeq: 0, inputTokens: 3, lastActiveAt: 0,
+      nextFireAt: 0, reloadUntil: 0, reloadSlot: null, healUntil: 0, grenadeFuseAt: 0,
       room: -1,
       knownLoot: new Set(),
       events: [],
       spectating: pid,
+      autoPickup: part.isBot,
+      marker: null,
       bot: null,
     };
     if (part.isBot) p.bot = new Bot(this.rng);
@@ -295,12 +417,16 @@ export class Match {
   }
 
   private buildZoneCircles(): ZoneCircle[] {
+    if (this.training) {
+      const still = { x: this.map.size / 2, y: this.map.size / 2, r: this.map.size * 2 };
+      return [still, ...ZONE_PHASES.map(() => ({ ...still }))];
+    }
     const rng = createRng(this.seed ^ 0x5bd1e995);
-    const circles: ZoneCircle[] = [{ x: MAP_SIZE / 2, y: MAP_SIZE / 2, r: MAP_SIZE * 0.75 }];
+    const circles: ZoneCircle[] = [{ x: this.map.size / 2, y: this.map.size / 2, r: this.map.size * 0.75 }];
     for (const phase of ZONE_PHASES) {
       const prev = circles[circles.length - 1];
-      const r = phase.radiusFraction * MAP_SIZE;
-      const maxOffset = Math.max(0, Math.min(prev.r, MAP_SIZE * 0.5) - r) * 0.85;
+      const r = phase.radiusFraction * this.map.size;
+      const maxOffset = Math.max(0, Math.min(prev.r, this.map.size * 0.5) - r) * 0.85;
       let x = prev.x;
       let y = prev.y;
       for (let i = 0; i < 30; i++) {
@@ -309,7 +435,7 @@ export class Match {
         const cx = prev.x + Math.cos(ang) * d;
         const cy = prev.y + Math.sin(ang) * d;
         const margin = r + 200;
-        if (cx > margin && cx < MAP_SIZE - margin && cy > margin && cy < MAP_SIZE - margin) {
+        if (cx > margin && cx < this.map.size - margin && cy > margin && cy < this.map.size - margin) {
           x = cx;
           y = cy;
           break;
@@ -330,34 +456,45 @@ export class Match {
     for (let i = 0; i < 40; i++) {
       const ang = this.rng() * Math.PI * 2;
       const d = i === 0 ? 0 : 10 + i * 6;
-      const px = clamp(x + Math.cos(ang) * d, 60, MAP_SIZE - 60);
-      const py = clamp(y + Math.sin(ang) * d, 60, MAP_SIZE - 60);
+      const px = clamp(x + Math.cos(ang) * d, 60, this.map.size - 60);
+      const py = clamp(y + Math.sin(ang) * d, 60, this.map.size - 60);
       if (!this.world.overlapsCircle(px, py, r)) return { x: px, y: py };
     }
     return { x, y };
   }
 
   private spawnPlayers() {
+    if (this.training) {
+      for (const p of this.players) Object.assign(p, { x: TRAINING_SPAWN.x, y: TRAINING_SPAWN.y, a: 0 });
+      return;
+    }
     const placed: { x: number; y: number; human: boolean }[] = [];
     // humans first so they get the widest choice of quiet spots
     const order = [...this.players].sort((a, b) => Number(!a.userId) - Number(!b.userId));
+    const anchors = new Map<number, Player>();
     for (const p of order) {
+      // teammates land together, around the first member placed
+      const anchor = anchors.get(p.team);
+      if (anchor) {
+        this.spawnNear(p, anchor);
+        continue;
+      }
+      anchors.set(p.team, p);
       const human = !!p.userId;
-      let best = { x: MAP_SIZE / 2, y: MAP_SIZE / 2 };
+      let best = { x: this.map.size / 2, y: this.map.size / 2 };
       let bestScore = -Infinity;
-      for (let i = 0; i < 400; i++) {
-        const x = 200 + this.rng() * (MAP_SIZE - 400);
-        const y = 200 + this.rng() * (MAP_SIZE - 400);
+      // best-candidate sampling: of several valid spots keep the one farthest from everyone, so a full map spreads out evenly
+      let candidates = 0;
+      for (let i = 0; i < 600 && candidates < SPAWN_CANDIDATES; i++) {
+        const x = 200 + this.rng() * (this.map.size - 400);
+        const y = 200 + this.rng() * (this.map.size - 400);
         if (this.world.overlapsCircle(x, y, PLAYER_RADIUS + 12) || this.insideHouse(x, y, 30)) continue;
+        candidates++;
         // score = how far past its required distance the closest neighbour is
         let score = Infinity;
         for (const q of placed) {
           const need = human || q.human ? HUMAN_SPAWN_DISTANCE : SPAWN_MIN_DISTANCE;
           score = Math.min(score, Math.hypot(q.x - x, q.y - y) - need);
-        }
-        if (score >= 0) {
-          best = { x, y };
-          break;
         }
         if (score > bestScore) {
           bestScore = score;
@@ -371,7 +508,61 @@ export class Match {
     }
   }
 
+  /** Everyone gathers in a circle in the middle of the map, outside the houses so they can see each other. */
+  private spawnInLobby() {
+    const size = this.map.size;
+    const r = clamp(650 + 140 * Math.sqrt(this.players.length), 1050, size * 0.4);
+    const area = { x: size / 2, y: size / 2, r };
+    this.lobbyArea = area;
+    const anchors = new Map<number, Player>();
+    for (const p of this.players) {
+      const anchor = anchors.get(p.team);
+      if (anchor) {
+        this.spawnNear(p, anchor);
+        if (Math.hypot(p.x - area.x, p.y - area.y) <= r - PLAYER_RADIUS) continue;
+      }
+      anchors.set(p.team, p);
+      let best = { x: area.x, y: area.y };
+      let bestGap = -Infinity;
+      for (let i = 0; i < 60; i++) {
+        const ang = this.rng() * Math.PI * 2;
+        const d = Math.sqrt(this.rng()) * (r - 60);
+        const x = area.x + Math.cos(ang) * d;
+        const y = area.y + Math.sin(ang) * d;
+        if (this.world.overlapsCircle(x, y, PLAYER_RADIUS + 8) || this.insideHouse(x, y, 30)) continue;
+        let gap = Infinity;
+        for (const o of this.players) if (o !== p && (o.x || o.y)) gap = Math.min(gap, Math.hypot(o.x - x, o.y - y));
+        if (gap > bestGap) {
+          bestGap = gap;
+          best = { x, y };
+        }
+        if (gap > PLAYER_RADIUS * 5) break;
+      }
+      p.x = best.x;
+      p.y = best.y;
+      p.a = this.rng() * Math.PI * 2;
+    }
+  }
+
+  private spawnNear(p: Player, anchor: Player) {
+    p.a = anchor.a;
+    for (let i = 0; i < 80; i++) {
+      const ang = this.rng() * Math.PI * 2;
+      const d = PLAYER_RADIUS * 3 + this.rng() * 70;
+      const x = clamp(anchor.x + Math.cos(ang) * d, 100, this.map.size - 100);
+      const y = clamp(anchor.y + Math.sin(ang) * d, 100, this.map.size - 100);
+      if (this.world.overlapsCircle(x, y, PLAYER_RADIUS + 8) || this.insideHouse(x, y, 30)) continue;
+      if (this.players.some((o) => o !== p && o !== anchor && o.team === p.team && Math.hypot(o.x - x, o.y - y) < PLAYER_RADIUS * 2.5)) continue;
+      p.x = x;
+      p.y = y;
+      return;
+    }
+    p.x = anchor.x;
+    p.y = anchor.y;
+  }
+
   private spawnInitialLoot() {
+    if (this.training) return this.setupTraining();
     const rng = this.rng;
     const spawnGround = (x: number, y: number) => {
       const item = pickWeighted(rng, GROUND_LOOT_TABLE);
@@ -385,13 +576,133 @@ export class Match {
         spawnGround(room.x + 40 + rng() * (room.w - 80), room.y + 40 + rng() * (room.h - 80));
       }
     }
+    const outdoorTarget = Math.max(OUTDOOR_LOOT_MIN, MAP_DEFS[this.mapId].maxPlayers * OUTDOOR_LOOT_PER_PLAYER);
     let outdoor = 0;
-    for (let i = 0; i < 2000 && outdoor < 160; i++) {
-      const x = 100 + rng() * (MAP_SIZE - 200);
-      const y = 100 + rng() * (MAP_SIZE - 200);
+    for (let i = 0; i < outdoorTarget * 12 && outdoor < outdoorTarget; i++) {
+      const x = 100 + rng() * (this.map.size - 200);
+      const y = 100 + rng() * (this.map.size - 200);
       if (this.insideHouse(x, y, 20) || this.world.overlapsCircle(x, y, 20)) continue;
       spawnGround(x, y);
       outdoor++;
+    }
+  }
+
+  // ---------------------------------------------------------------- training range
+
+  private setupTraining() {
+    for (const p of this.players) {
+      const gun = (w: WeaponId): WeaponSlot => ({ w, mag: WEAPONS[w].magSize });
+      p.p1 = gun(TRAINING_KIT.p1);
+      p.p2 = gun(TRAINING_KIT.p2);
+      p.pistol = gun(TRAINING_KIT.pistol);
+      p.melee = TRAINING_KIT.melee;
+      p.bag = 3;
+      p.scopes = new Set<ScopeLevel>(SCOPE_LEVELS);
+      p.active = 'p1';
+      p.lastWeaponSlot = 'p1';
+      this.restock(p);
+    }
+    RACK_ITEMS.forEach((item, i) => {
+      const y = RACK_Y0 + i * RACK_STEP;
+      this.racks.push({ item, y, lootId: this.spawnLoot(item, RACK_X, y).id, respawnAt: 0 });
+    });
+    TRAINING_LANES.forEach((lane, li) => {
+      for (let i = 0; i < lane.boars; i++) {
+        const y = LANE_Y0 + ((LANE_Y1 - LANE_Y0) * (i + 0.3 + this.rng() * 0.4)) / lane.boars;
+        this.boars.push({
+          id: this.nextId++, lane: li, x: laneX(lane), y, dir: this.rng() < 0.5 ? 1 : -1, speed: lane.speed,
+          hp: BOAR_HP, deadUntil: 0, pauseUntil: 0, nextChange: 1000 + this.rng() * 2500,
+        });
+      }
+    });
+  }
+
+  /** Free ammo, grenades and smoke, and no damage taken. */
+  private restock(p: Player) {
+    const cap = this.capacity(p);
+    for (const t of AMMO_TYPES) p.ammo[t] = cap.ammo[t];
+    p.gren = cap.grenade;
+    p.smoke = cap.smoke;
+    p.hp = MAX_HP;
+  }
+
+  private updateTraining() {
+    const now = this.now;
+    for (const p of this.players) if (p.alive) this.restock(p);
+
+    for (const r of this.racks) {
+      if (this.loot.has(r.lootId)) continue;
+      if (!r.respawnAt) r.respawnAt = now + RACK_RESPAWN_MS;
+      else if (now >= r.respawnAt) {
+        r.lootId = this.spawnLoot(r.item, RACK_X, r.y).id;
+        r.respawnAt = 0;
+      }
+    }
+
+    for (const b of this.boars) {
+      if (b.hp <= 0) {
+        if (now >= b.deadUntil) {
+          // a new boar runs in from one end of its lane
+          const fromTop = this.rng() < 0.5;
+          Object.assign(b, {
+            id: this.nextId++, y: fromTop ? LANE_Y0 : LANE_Y1, dir: fromTop ? 1 : -1, hp: BOAR_HP,
+            speed: TRAINING_LANES[b.lane].speed, pauseUntil: 0, nextChange: now + 1500 + this.rng() * 2000,
+          });
+        }
+        continue;
+      }
+      if (now >= b.nextChange) {
+        const roll = this.rng();
+        if (roll < 0.18) b.pauseUntil = now + 400 + this.rng() * 800;
+        else if (roll < 0.5) b.dir = b.dir === 1 ? -1 : 1;
+        b.speed = TRAINING_LANES[b.lane].speed * (0.7 + this.rng() * 0.6);
+        b.nextChange = now + 1200 + this.rng() * 2800;
+      }
+      if (now < b.pauseUntil) continue;
+      b.y += b.dir * b.speed * TICK_S;
+      if (b.y <= LANE_Y0) {
+        b.y = LANE_Y0;
+        b.dir = 1;
+      } else if (b.y >= LANE_Y1) {
+        b.y = LANE_Y1;
+        b.dir = -1;
+      }
+    }
+    // boars sharing a lane turn around instead of running through each other
+    for (let i = 0; i < this.boars.length; i++) {
+      const a = this.boars[i];
+      if (a.hp <= 0) continue;
+      for (let j = i + 1; j < this.boars.length; j++) {
+        const b = this.boars[j];
+        if (b.hp <= 0 || b.lane !== a.lane || Math.abs(a.y - b.y) > BOAR_RADIUS * 2.4) continue;
+        const [top, bottom] = a.y < b.y ? [a, b] : [b, a];
+        if (top.dir === 1) top.dir = -1;
+        if (bottom.dir === -1) bottom.dir = 1;
+      }
+    }
+  }
+
+  /** `shot` marks bullet hits, which are the ones counted for accuracy and distance. */
+  private damageBoar(b: Boar, amount: number, attacker: Player | null, shot: boolean) {
+    if (b.hp <= 0 || amount <= 0) return;
+    const dmg = Math.min(amount, b.hp);
+    b.hp -= dmg;
+    if (!attacker) return;
+    const st = this.trainingStats;
+    const d = Math.round(Math.hypot(b.x - attacker.x, b.y - attacker.y));
+    attacker.damage += dmg;
+    this.personal(attacker, { k: 'dmg', x: b.x, y: b.y, n: Math.round(dmg) });
+    if (shot) {
+      st.hits++;
+      st.last = d;
+      st.best = Math.max(st.best, d);
+    }
+    if (b.hp <= 0.001) {
+      b.hp = 0;
+      b.deadUntil = this.now + BOAR_RESPAWN_MS;
+      st.kills++;
+      attacker.kills++;
+      this.personal(attacker, { k: 'boarDown', x: Math.round(b.x), y: Math.round(b.y), d });
     }
   }
 
@@ -429,6 +740,7 @@ export class Match {
 
   detachSocket(pid: number) {
     const p = this.players[pid];
+    if (p.alive && p.active === 'grenade') this.holsterThrowable(p);
     p.socket = null;
     p.connected = false;
     p.mx = 0;
@@ -441,10 +753,13 @@ export class Match {
     return {
       matchId: this.id,
       mode: this.mode,
-      seed: this.seed,
+      mapId: this.mapId,
       you: pid,
+      teamSize: this.teamSize,
       roster: this.players.map<RosterEntry>((p) => ({
         pid: p.pid, name: p.name, avatar: p.avatar, level: p.level, isBot: p.isBot,
+        ...(this.isTeamMatch ? { team: p.team } : {}),
+        ...(p.admin ? { admin: true } : {}),
       })),
       doorsOpen: [...this.world.doorOpen],
       chestsAlive: [...this.world.chestAlive],
@@ -470,27 +785,57 @@ export class Match {
     };
     p.inputQueue.push(input);
     if (p.inputQueue.length > 8) p.inputQueue.shift();
+    if (input.mx || input.my || input.f) p.lastActiveAt = this.now;
   }
 
   handleAction(pid: number, msg: ActionMsg) {
     const p = this.players[pid];
-    if (!p.alive || !msg || typeof msg !== 'object') return;
+    if (!msg || typeof msg !== 'object') return;
+    p.lastActiveAt = this.now;
+    if (msg.t === 'autoPickup') {
+      p.autoPickup = msg.on === true;
+      return;
+    }
+    // the dead still guide their team, and the waiting area is a good time to agree where to go
+    if (msg.t === 'mark' || msg.t === 'unmark') {
+      this.setMarker(p, msg.t === 'mark' ? msg : null);
+      return;
+    }
+    if (!p.alive) return;
+    // the waiting area has nothing to pick up or fight with, only doors to open
+    if (this.inLobby && msg.t !== 'interact') return;
     switch (msg.t) {
       case 'reload': this.reload(p); break;
       case 'interact': this.interact(p); break;
+      case 'pickup': this.pickupById(p, Number(msg.id)); break;
       case 'equip': this.equip(p, msg.slot); break;
       case 'heal': this.heal(p); break;
       case 'scope': this.setScope(p, Number(msg.level)); break;
-      case 'drop': this.drop(p, String(msg.what)); break;
+      case 'drop': if (!this.training) this.drop(p, String(msg.what)); break;
     }
+  }
+
+  private setMarker(p: Player, at: { x: unknown; y: unknown } | null) {
+    if (!at) {
+      p.marker = null;
+      return;
+    }
+    const x = Number(at.x);
+    const y = Number(at.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const size = this.map.size;
+    p.marker = { x: clamp(Math.round(x), 0, size), y: clamp(Math.round(y), 0, size) };
   }
 
   spectate(pid: number, target: 'killer' | 'next') {
     const p = this.players[pid];
     if (p.alive) return;
-    const alive = this.players.filter((o) => o.alive);
+    let alive = this.players.filter((o) => o.alive);
     if (!alive.length) return;
-    if (target === 'killer' && this.players[p.killer]?.alive) {
+    // while the team is still fighting, its dead may only watch their own side
+    const mates = alive.filter((o) => o.team === p.team);
+    if (mates.length) alive = mates;
+    else if (target === 'killer' && this.players[p.killer]?.alive) {
       p.spectating = p.killer;
       return;
     }
@@ -507,6 +852,79 @@ export class Match {
 
   pidOfUser(userId: string): number {
     return this.players.find((p) => p.userId === userId)?.pid ?? -1;
+  }
+
+  // ---------------------------------------------------------------- admin observers
+
+  summary(): LiveMatchSummary {
+    return {
+      id: this.id,
+      mode: this.mode,
+      name: this.title,
+      mapId: this.mapId,
+      teamSize: this.teamSize,
+      players: this.players.length,
+      humans: this.players.filter((p) => !p.isBot && !p.left).length,
+      alive: this.aliveCount,
+      elapsedMs: Math.round(this.now),
+      lobby: this.inLobby,
+      observers: this.observers.size,
+    };
+  }
+
+  observe(userId: string, socket: Socket) {
+    const o: Observer = { socket, watching: -1, knownLoot: new Set(), events: [] };
+    this.observers.set(userId, o);
+    const human = this.players.find((p) => p.alive && !p.isBot);
+    o.watching = human?.pid ?? this.players.find((p) => p.alive)?.pid ?? 0;
+    socket.emit('match:start', { ...this.startMsg(-1), observer: true });
+  }
+
+  /** Removes an observer; with a socket given, only when it is still the one watching (not a newer tab). */
+  unobserve(userId: string, socket?: Socket): boolean {
+    const o = this.observers.get(userId);
+    if (!o || (socket && o.socket !== socket)) return false;
+    return this.observers.delete(userId);
+  }
+
+  observerIds(): string[] {
+    return [...this.observers.keys()];
+  }
+
+  /** Moves an observer to the next (1) or previous (-1) player still in the fight. */
+  stepObserver(userId: string, dir: 1 | -1) {
+    const o = this.observers.get(userId);
+    if (o) this.retarget(o, dir);
+  }
+
+  private retarget(o: Observer, dir: 1 | -1) {
+    const alive = this.players.filter((p) => p.alive);
+    if (!alive.length) return;
+    const idx = alive.findIndex((p) => p.pid === o.watching);
+    if (idx >= 0) o.watching = alive[(idx + dir + alive.length) % alive.length].pid;
+    else o.watching = (alive.find((p) => p.pid > o.watching) ?? alive[0]).pid;
+  }
+
+  private updateObservers() {
+    for (const o of this.observers.values()) {
+      if (!this.players[o.watching]?.alive) this.retarget(o, 1);
+    }
+  }
+
+  /**
+   * An admin removes the player they are watching: eliminated like a leaver, sent back to the lobby,
+   * and announced to everyone. Fails if the observer has moved on to someone else meanwhile.
+   */
+  kick(userId: string, pid: number): Player | null {
+    const o = this.observers.get(userId);
+    const p = this.players[pid];
+    if (!o || !p || o.watching !== pid || !p.alive) return null;
+    p.socket?.emit('match:kicked');
+    this.kill(p, -1, 'kick');
+    p.left = true;
+    this.detachSocket(pid);
+    this.retarget(o, 1);
+    return p;
   }
 
   // ---------------------------------------------------------------- main loop
@@ -530,7 +948,62 @@ export class Match {
     }
   }
 
+  private consumeInputs(p: Player) {
+    if (!p.connected) {
+      p.moving = false;
+      p.fire = false;
+      return;
+    }
+    p.inputTokens = Math.min(p.inputTokens + 1, 3);
+    let moved = false;
+    while (p.inputQueue.length && p.inputTokens >= 1) {
+      const input = p.inputQueue.shift()!;
+      p.inputTokens--;
+      p.a = input.a;
+      p.fire = input.f;
+      p.td = input.td;
+      p.lastSeq = input.s;
+      this.applyMovement(p, input.mx, input.my);
+      moved = true;
+    }
+    if (!moved) p.moving = false;
+  }
+
+  /** Waiting area: players only walk around (bots wait in place); nothing can be fired, picked up or hurt. */
+  private lobbyTick() {
+    this.tickCount++;
+    this.lobbyLeft = Math.max(0, this.lobbyLeft - TICK_MS);
+    for (const p of this.players) {
+      if (!p.alive || p.bot) continue;
+      this.consumeInputs(p);
+      p.fire = false;
+    }
+    this.resolveDeaths();
+    if (this.ended) return;
+    this.checkEarlyFinish();
+    if (this.ended) return;
+    if (this.lobbyLeft === 0) this.goLive();
+    if (this.tickCount % SNAPSHOT_EVERY_TICKS === 0) this.sendSnapshots();
+  }
+
+  /** Closes the waiting area: doors go back to how the map starts, everyone moves to their real spawn. */
+  private goLive() {
+    this.lobbyArea = null;
+    this.initialDoors.forEach((open, id) => {
+      if (this.world.doorOpen[id] === open) return;
+      this.world.doorOpen[id] = open;
+      this.globalEvent({ k: 'door', id, open });
+    });
+    this.spawnPlayers();
+    for (const p of this.players) {
+      p.room = roomAt(this.map, p.x, p.y);
+      p.prevFire = true;
+    }
+    this.globalEvent({ k: 'go' });
+  }
+
   private tick() {
+    if (this.inLobby) return this.lobbyTick();
     this.simTime += TICK_MS;
     this.tickCount++;
     const now = this.simTime;
@@ -541,45 +1014,32 @@ export class Match {
       if (p.bot) {
         p.bot.update(this, p);
         this.applyMovement(p, p.mx, p.my);
-      } else if (p.connected) {
-        p.inputTokens = Math.min(p.inputTokens + 1, 3);
-        let moved = false;
-        while (p.inputQueue.length && p.inputTokens >= 1) {
-          const input = p.inputQueue.shift()!;
-          p.inputTokens--;
-          p.a = input.a;
-          p.fire = input.f;
-          p.td = input.td;
-          p.lastSeq = input.s;
-          this.applyMovement(p, input.mx, input.my);
-          moved = true;
-        }
-        if (!moved) p.moving = false;
       } else {
-        p.moving = false;
-        p.fire = false;
+        this.consumeInputs(p);
       }
       this.updateTimers(p);
       this.updateFiring(p);
       this.autoPickup(p);
     }
 
+    if (this.training) this.updateTraining();
     this.updateBullets();
     this.updateThrowables();
     this.updateSmokes();
     this.updateZoneDamage();
-    this.updateAirdrops();
+    if (!this.training) this.updateAirdrops();
     this.resolveDeaths();
     if (this.ended) return;
     this.checkEarlyFinish();
     if (this.ended) return;
+    if (this.isTeamMatch) this.updateSpectators();
 
     if (this.tickCount % SNAPSHOT_EVERY_TICKS === 0) this.sendSnapshots();
   }
 
   private applyMovement(p: Player, mx: number, my: number) {
-    const speed = playerSpeed(this.activeWeapon(p), p.healUntil > 0);
-    const pos = stepMovement(this.world, p.x, p.y, mx, my, speed, TICK_S);
+    const speed = playerSpeed(this.activeWeapon(p), p.healUntil > 0) * (p.isBot ? this.botSpeed : 1);
+    const pos = stepMovement(this.world, p.x, p.y, mx, my, speed, TICK_S, this.lobbyArea);
     p.moving = Math.abs(pos.x - p.x) + Math.abs(pos.y - p.y) > 0.5;
     p.x = pos.x;
     p.y = pos.y;
@@ -627,6 +1087,7 @@ export class Match {
     if (slot === 'smoke' && p.smoke <= 0) return;
     if (slot === p.active) return;
     p.active = slot;
+    p.grenadeFuseAt = slot === 'grenade' ? this.now + THROWABLE.grenade.fuseMs : 0;
     if (slot !== 'grenade' && slot !== 'smoke') p.lastWeaponSlot = slot;
     p.reloadUntil = 0;
     p.reloadSlot = null;
@@ -663,9 +1124,9 @@ export class Match {
       if (!best || d < best.d) best = { d, run };
     };
 
-    for (const l of this.loot.values()) {
+    if (!this.inLobby) for (const l of this.loot.values()) {
       const d = Math.hypot(l.x - p.x, l.y - p.y);
-      if (d <= PICKUP_RANGE) consider(d, () => this.pickup(p, l, true));
+      if (d <= PICKUP_RANGE && this.world.lineClear(p.x, p.y, l.x, l.y)) consider(d, () => this.pickup(p, l, true));
     }
     for (const door of this.map.doors) {
       const d = Math.hypot(door.x + door.w / 2 - p.x, door.y + door.h / 2 - p.y);
@@ -677,6 +1138,13 @@ export class Match {
       if (d <= INTERACT_RANGE + AIRDROP_SIZE / 2) consider(d, () => this.openAirdrop(ad));
     }
     (best as Target | null)?.run();
+  }
+
+  /** A right click names the item to pick up; the same reach rules as the interact key apply. */
+  private pickupById(p: Player, id: number) {
+    const l = this.loot.get(id);
+    if (!l || Math.hypot(l.x - p.x, l.y - p.y) > PICKUP_RANGE || !this.world.lineClear(p.x, p.y, l.x, l.y)) return;
+    this.pickup(p, l, true);
   }
 
   private toggleDoor(p: Player, id: number) {
@@ -708,7 +1176,7 @@ export class Match {
       case 'ammo': {
         const type = loot.item.slice(5) as AmmoType;
         const room = cap.ammo[type] - p.ammo[type];
-        if (room <= 0) return notice('Túi đã đầy loại đạn này.'), false;
+        if (room <= 0) return notice(`Gùi đã đầy ${AMMO_NAMES[type].toLowerCase()}.`), false;
         const n = Math.min(room, loot.amount);
         p.ammo[type] += n;
         loot.amount -= n;
@@ -724,23 +1192,24 @@ export class Match {
       case 'grenade':
       case 'smoke': {
         const key = def.kind === 'medkit' ? 'med' : def.kind === 'grenade' ? 'gren' : 'smoke';
-        if (p[key] >= cap[def.kind]) return notice('Túi đã đầy, hãy nâng cấp túi đồ.'), false;
+        if (p[key] >= cap[def.kind]) return notice('Gùi đã đầy, hãy tìm gùi lớn hơn.'), false;
         p[key]++;
         take();
         return true;
       }
       case 'scope': {
         const level = scopeOfItem(loot.item) as ScopeLevel;
-        if (p.scopes.has(level)) return notice('Bạn đã có ống nhắm này.'), false;
+        if (p.scopes.has(level)) return notice(`Bạn đã thuần phục ${def.name.toLowerCase()} rồi.`), false;
         p.scopes.add(level);
-        p.scope = level;
+        // only a stronger scope takes over the view; a weaker one just goes in the bag
+        if (level > p.scope) p.scope = level;
         take();
         return true;
       }
       case 'bag': {
         if (!manual) return false;
         const level = Number(loot.item.slice(3)) as BagLevel;
-        if (level <= p.bag) return notice('Bạn đang có túi đồ tốt hơn hoặc bằng.'), false;
+        if (level <= p.bag) return notice('Bạn đang đeo gùi tốt hơn hoặc bằng.'), false;
         if (p.bag > 0) this.spawnLoot(`bag${p.bag}` as ItemId, p.x, p.y);
         p.bag = level;
         take();
@@ -773,7 +1242,8 @@ export class Match {
         else target = p.active === 'p2' ? 'p2' : 'p1';
         const old = p[target];
         take();
-        if (old) this.spawnLoot(old.w as ItemId, p.x, p.y, old.mag);
+        // the range rack restocks itself, so swapped-out guns are not left lying around
+        if (old && !this.training) this.spawnLoot(old.w as ItemId, p.x, p.y, old.mag);
         p[target] = newSlot;
         if (p.active === 'melee' || p.active === target || !old) {
           p.active = '' as SlotName;
@@ -786,11 +1256,11 @@ export class Match {
   }
 
   private autoPickup(p: Player) {
-    if (this.tickCount % 3 !== 0) return;
+    if (!p.autoPickup || this.tickCount % 3 !== 0) return;
     for (const l of this.loot.values()) {
       if (Math.abs(l.x - p.x) > PLAYER_RADIUS + 18 || Math.abs(l.y - p.y) > PLAYER_RADIUS + 18) continue;
       const kind = ITEMS[l.item].kind;
-      if (kind === 'ammo' || kind === 'medkit' || kind === 'grenade' || kind === 'smoke' || kind === 'scope') {
+      if ((kind === 'ammo' || kind === 'medkit' || kind === 'grenade' || kind === 'smoke' || kind === 'scope') && this.world.lineClear(p.x, p.y, l.x, l.y)) {
         this.pickup(p, l, false);
       }
     }
@@ -869,6 +1339,10 @@ export class Match {
 
   private updateFiring(p: Player) {
     const now = this.now;
+    if (p.active === 'grenade' && p.grenadeFuseAt > 0 && now >= p.grenadeFuseAt) {
+      this.cookOff(p);
+      return;
+    }
     const firePressed = p.fire && !p.prevFire;
     p.prevFire = p.fire;
     if (!p.fire) return;
@@ -901,6 +1375,7 @@ export class Match {
     p.nextFireAt = this.now + 1000 / def.fireRate;
     slot.mag--;
     const spread = ((def.spread + (p.moving ? def.moveSpread : 0)) * Math.PI) / 180;
+    if (this.training) this.trainingStats.shots += def.pellets;
     for (let i = 0; i < def.pellets; i++) {
       const ang = p.a + (this.rng() * 2 - 1) * spread;
       const b: Bullet = {
@@ -933,7 +1408,7 @@ export class Match {
     let hit: (() => void) | null = null;
 
     for (const o of this.players) {
-      if (o === p || !o.alive) continue;
+      if (o === p || !o.alive || o.team === p.team) continue;
       const d = Math.hypot(o.x - p.x, o.y - p.y);
       if (d - PLAYER_RADIUS > reach || d >= bestD) continue;
       if (Math.abs(angleDiff(p.a, Math.atan2(o.y - p.y, o.x - p.x))) > arc) continue;
@@ -941,6 +1416,14 @@ export class Match {
       if (block && block.t * d < d - PLAYER_RADIUS) continue;
       bestD = d;
       hit = () => this.applyDamage(o, def.damage, p, p.melee);
+    }
+    for (const b of this.boars) {
+      if (b.hp <= 0) continue;
+      const d = Math.hypot(b.x - p.x, b.y - p.y);
+      if (d - BOAR_RADIUS > reach || d >= bestD) continue;
+      if (Math.abs(angleDiff(p.a, Math.atan2(b.y - p.y, b.x - p.x))) > arc) continue;
+      bestD = d;
+      hit = () => this.damageBoar(b, def.damage, p, false);
     }
     for (const c of this.map.chests) {
       if (!this.world.chestAlive[c.id]) continue;
@@ -965,7 +1448,8 @@ export class Match {
     p.nextFireAt = this.now + 600;
     const dist = clamp(p.td, 40, THROWABLE.maxDistance);
     const speed = dist / (THROWABLE.flightMs / 1000);
-    const fuse = kind === 0 ? THROWABLE.grenade.fuseMs : THROWABLE.smoke.fuseMs;
+    // a grenade keeps whatever fuse is left from the moment it was drawn
+    const triggerAt = kind === 0 && p.grenadeFuseAt > 0 ? p.grenadeFuseAt : this.now + (kind === 0 ? THROWABLE.grenade.fuseMs : THROWABLE.smoke.fuseMs);
     this.throwables.push({
       id: this.nextId++,
       kind,
@@ -975,18 +1459,33 @@ export class Match {
       vx: Math.cos(p.a) * speed,
       vy: Math.sin(p.a) * speed,
       flightLeft: THROWABLE.flightMs,
-      triggerAt: this.now + fuse,
+      triggerAt,
     });
     this.spatialEvent(p.x, p.y, { k: 'throw', pid: p.pid });
-    if ((kind === 0 && p.gren === 0) || (kind === 1 && p.smoke === 0)) {
-      const back = p.lastWeaponSlot;
-      p.active = '' as SlotName;
-      this.equip(p, back === 'p1' || back === 'p2' || back === 'pistol' ? (p[back] ? back : 'melee') : 'melee');
-    }
+    if ((kind === 0 && p.gren === 0) || (kind === 1 && p.smoke === 0)) this.holsterThrowable(p);
+    else if (kind === 0) p.grenadeFuseAt = this.now + THROWABLE.grenade.fuseMs;
+  }
+
+  /** Puts the grenade or smoke away and goes back to the last gun, or the melee weapon. */
+  holsterThrowable(p: Player) {
+    const back = p.lastWeaponSlot;
+    p.active = '' as SlotName;
+    this.equip(p, back === 'p1' || back === 'p2' || back === 'pistol' ? (p[back] ? back : 'melee') : 'melee');
+  }
+
+  /** Held too long: the grenade explodes in the player's hand. */
+  private cookOff(p: Player) {
+    p.gren--;
+    p.grenadeFuseAt = 0;
+    this.personal(p, { k: 'notice', text: '💥 Hũ lửa nổ trên tay! Hãy ném trước khi cháy hết ngòi.' });
+    this.explode({ id: this.nextId++, kind: 0, owner: p.pid, x: p.x, y: p.y, vx: 0, vy: 0, flightLeft: 0, triggerAt: this.now });
+    if (p.alive) this.holsterThrowable(p);
   }
 
   applyDamage(target: Player, amount: number, attacker: Player | null, weapon: string, ignoreArmor = false) {
-    if (!target.alive || amount <= 0) return;
+    if (!target.alive || amount <= 0 || this.training) return;
+    // no friendly fire; your own grenade still hurts you
+    if (attacker && attacker !== target && attacker.team === target.team) return;
     let dmg = amount;
     if (!ignoreArmor && target.armor > 0) {
       const absorbed = dmg * ARMOR[target.armor as 1 | 2 | 3].reduction;
@@ -1020,8 +1519,8 @@ export class Match {
     target.fire = false;
     const k = killer >= 0 ? this.players[killer] : null;
     if (k && k !== target) k.kills++;
-    target.spectating = k && k !== target && k.alive ? k.pid : target.pid;
-    this.dropAll(target);
+    target.spectating = this.aliveMate(target)?.pid ?? (k && k !== target && k.alive ? k.pid : target.pid);
+    if (!this.training) this.dropAll(target);
     this.globalEvent({ k: 'kill', killer, victim: target.pid, w: weapon });
     this.pendingDeaths.push(target);
   }
@@ -1075,12 +1574,24 @@ export class Match {
       let hitPlayer: Player | null = null;
       const obstacle = this.world.raycast(b.x, b.y, x2, y2);
       if (obstacle) bestT = obstacle.t;
+      const ownerTeam = this.players[b.owner]?.team;
       for (const o of this.players) {
-        if (!o.alive || o.pid === b.owner) continue;
+        // bullets pass through teammates
+        if (!o.alive || o.team === ownerTeam) continue;
         const t = segmentCircle(b.x, b.y, x2, y2, o.x, o.y, PLAYER_RADIUS);
         if (t >= 0 && t < bestT) {
           bestT = t;
           hitPlayer = o;
+        }
+      }
+      let hitBoar: Boar | null = null;
+      for (const bo of this.boars) {
+        if (bo.hp <= 0) continue;
+        const t = segmentCircle(b.x, b.y, x2, y2, bo.x, bo.y, BOAR_RADIUS);
+        if (t >= 0 && t < bestT) {
+          bestT = t;
+          hitBoar = bo;
+          hitPlayer = null;
         }
       }
       if (bestT === Infinity) {
@@ -1099,10 +1610,12 @@ export class Match {
       const damage = b.damage * falloff;
       if (hitPlayer) {
         this.applyDamage(hitPlayer, damage, this.players[b.owner], b.weapon);
+      } else if (hitBoar) {
+        this.damageBoar(hitBoar, damage, this.players[b.owner], true);
       } else if (obstacle?.collider.kind === 'chest') {
         this.damageChest(obstacle.collider.id, damage);
       }
-      this.spatialEvent(hx, hy, { k: 'bulletEnd', id: b.id, x: hx, y: hy, blood: !!hitPlayer });
+      this.spatialEvent(hx, hy, { k: 'bulletEnd', id: b.id, x: hx, y: hy, blood: !!hitPlayer || !!hitBoar });
     }
     this.bullets = keep;
   }
@@ -1152,6 +1665,15 @@ export class Match {
     for (const c of this.map.chests) {
       if (this.world.chestAlive[c.id] && Math.hypot(c.x - t.x, c.y - t.y) < g.radius) this.damageChest(c.id, g.maxDamage);
     }
+    for (const b of this.boars) {
+      if (b.hp <= 0) continue;
+      const d = Math.hypot(b.x - t.x, b.y - t.y);
+      if (d > g.radius + BOAR_RADIUS) continue;
+      const block = this.world.raycast(t.x, t.y, b.x, b.y, true);
+      if (block && block.t * d < d - BOAR_RADIUS) continue;
+      const k = clamp(1 - d / (g.radius + BOAR_RADIUS), 0, 1);
+      this.damageBoar(b, g.minDamage + (g.maxDamage - g.minDamage) * k, owner, false);
+    }
   }
 
   smokeRadius(s: Smoke): number {
@@ -1183,8 +1705,8 @@ export class Match {
         for (let i = 0; i < 40; i++) {
           const ang = this.rng() * Math.PI * 2;
           const d = Math.sqrt(this.rng()) * r;
-          const x = clamp(z.tx + Math.cos(ang) * d, 150, MAP_SIZE - 150);
-          const y = clamp(z.ty + Math.sin(ang) * d, 150, MAP_SIZE - 150);
+          const x = clamp(z.tx + Math.cos(ang) * d, 150, this.map.size - 150);
+          const y = clamp(z.ty + Math.sin(ang) * d, 150, this.map.size - 150);
           if (!this.world.overlapsCircle(x, y, AIRDROP_SIZE) && !this.insideHouse(x, y, 40)) {
             pos = { x, y };
             break;
@@ -1203,10 +1725,10 @@ export class Match {
 
   private openAirdrop(ad: Airdrop) {
     this.airdrops = this.airdrops.filter((a) => a !== ad);
+    const ammoBoxes = this.rng() < 0.5 ? 1 : 2;
     const items: [ItemId, number?][] = [
       ['sniper'],
-      ['ammo_762'],
-      ['ammo_762'],
+      ...Array.from({ length: ammoBoxes }, (): [ItemId] => ['ammo_762']),
       ['armor3'],
       [this.rng() < 0.5 ? 'scope6' : 'scope8'],
       ['medkit'],
@@ -1221,28 +1743,40 @@ export class Match {
     if (!this.pendingDeaths.length) return;
     const deaths = this.pendingDeaths;
     this.pendingDeaths = [];
-    const alive = this.aliveCount;
-    deaths
-      .map((p) => ({ p, r: this.rng() }))
-      .sort((a, b) => b.p.deathTime - a.p.deathTime || a.r - b.r)
-      .forEach(({ p }, i) => {
-        p.placement = alive + 1 + i;
+    // a team is ranked once its last member falls (in solo every player is their own team)
+    const aliveTeams = this.aliveTeams;
+    const wiped = [...new Set(deaths.map((p) => p.team))].filter((team) => !this.teamAlive(team));
+    const lastDeath = (team: number) => Math.max(...this.players.filter((p) => p.team === team).map((p) => p.deathTime));
+    wiped
+      .map((team) => ({ team, t: lastDeath(team), r: this.rng() }))
+      .sort((a, b) => b.t - a.t || a.r - b.r)
+      .forEach(({ team }, i) => {
+        for (const p of this.players) if (p.team === team) p.placement = aliveTeams + 1 + i;
       });
     for (const p of deaths) {
       p.socket?.emit('match:dead', this.deathMsg(p));
     }
+    this.updateSpectators();
+    this.updateObservers();
+    if (aliveTeams <= 1) this.finish();
+  }
+
+  /** Keeps every dead player watching someone alive, and on their own team while any of it still fights. */
+  private updateSpectators() {
     for (const p of this.players) {
-      if (!p.alive && !this.players[p.spectating]?.alive) {
-        const next = this.players[p.killer]?.alive ? p.killer : this.players.find((o) => o.alive)?.pid;
-        if (next !== undefined) p.spectating = next;
-      }
+      if (p.alive) continue;
+      const watched = this.players[p.spectating];
+      const mate = this.aliveMate(p);
+      if (watched?.alive && (!mate || watched.team === p.team)) continue;
+      const next = mate?.pid ?? (this.players[p.killer]?.alive ? p.killer : this.players.find((o) => o.alive)?.pid);
+      if (next !== undefined) p.spectating = next;
     }
-    if (alive <= 1) this.finish();
   }
 
   private deathMsg(p: Player): DeathMsg {
     return {
       placement: p.placement,
+      teamAlive: this.isTeamMatch && this.teamAlive(p.team),
       killer: p.killer,
       weapon: p.killWeapon,
       kills: p.kills,
@@ -1252,6 +1786,18 @@ export class Match {
   }
 
   private checkEarlyFinish() {
+    if (this.training) {
+      const idle = this.players.find((p) => p.connected && this.now - p.lastActiveAt >= TRAINING_IDLE_MS);
+      if (idle) {
+        idle.socket?.emit('match:closed', { text: `Buổi tập đã kết thúc vì bạn không thao tác trong ${TRAINING_IDLE_MS / 60_000} phút.` });
+        this.finish();
+        return;
+      }
+      if (this.players.some((p) => p.connected)) this.awaySince = -1;
+      else if (this.awaySince < 0) this.awaySince = this.now;
+      else if (this.now - this.awaySince >= TRAINING_AWAY_MS) this.finish();
+      return;
+    }
     const humans = this.players.filter((p) => !p.isBot);
     if (humans.every((h) => !h.alive && (h.left || !h.connected))) this.finish();
   }
@@ -1260,28 +1806,40 @@ export class Match {
     if (this.ended) return;
     this.ended = true;
     clearInterval(this.timer);
-    const alive = this.players.filter((p) => p.alive);
-    if (alive.length === 1) alive[0].placement = 1;
-    let rank = 2;
-    for (const p of alive.slice(1).sort((a, b) => b.hp - a.hp)) p.placement = rank++;
-    const winner = this.players.find((p) => p.placement === 1);
-    const winnerName = winner?.name ?? '—';
+    // practice sessions have no placement, XP or history
+    if (this.training) return this.callbacks.onEnd(this, [], '—');
+    // teams still standing (only one, unless the match ended early) are ranked by their total health
+    const hpOf = new Map<number, number>();
+    for (const p of this.players) if (p.alive) hpOf.set(p.team, (hpOf.get(p.team) ?? 0) + p.hp);
+    let rank = 1;
+    for (const [team] of [...hpOf].sort((a, b) => b[1] - a[1])) {
+      for (const p of this.players) if (p.team === team) p.placement = rank;
+      rank++;
+    }
+    const winnerName = this.players.filter((p) => p.placement === 1).map((p) => p.name).join(' & ') || '—';
     const leaderboard: LeaderboardEntry[] = this.players
       .filter((p) => p.placement > 0)
-      .sort((a, b) => a.placement - b.placement)
-      .map((p) => ({ name: p.name, avatar: p.avatar, placement: p.placement, kills: p.kills, isBot: p.isBot }));
+      .sort((a, b) => a.placement - b.placement || a.team - b.team || b.kills - a.kills)
+      .map((p) => ({
+        name: p.name, avatar: p.avatar, placement: p.placement, kills: p.kills, isBot: p.isBot,
+        ...(this.isTeamMatch ? { team: p.team } : {}),
+        ...(p.admin ? { admin: true } : {}),
+      }));
 
     const results: MatchResultPlayer[] = [];
     for (const p of this.players) {
       if (p.isBot || !p.userId) continue;
       const survivalMs = p.alive ? this.now : p.deathTime;
-      const placement = p.placement || this.players.length;
-      const xpGained = xpForMatch({ placement, kills: p.kills, survivalMs, playerCount: this.players.length });
+      const placement = p.placement || this.teamCount;
+      // in team matches the placement bonus counts teams outranked
+      const xpGained = xpForMatch({ placement, kills: p.kills, survivalMs, playerCount: this.teamCount });
       results.push({ userId: p.userId, placement, kills: p.kills, damage: p.damage, survivalMs, xpGained });
       const msg: MatchEndMsg = {
         mode: this.mode,
         placement,
         playerCount: this.players.length,
+        teamSize: this.teamSize,
+        teamCount: this.teamCount,
         kills: p.kills,
         damage: Math.round(p.damage),
         survivalMs,
@@ -1292,6 +1850,7 @@ export class Match {
       };
       if (p.connected && !p.left) p.socket?.emit('match:end', msg);
     }
+    for (const o of this.observers.values()) o.socket.emit('observe:ended', { winnerName });
     this.callbacks.onEnd(this, results, winnerName);
   }
 
@@ -1338,14 +1897,21 @@ export class Match {
 
   private globalEvent(e: GameEvent) {
     for (const p of this.players) this.personal(p, e);
+    for (const o of this.observers.values()) o.events.push(e);
   }
 
   private spatialEvent(x: number, y: number, e: GameEvent) {
+    const near = (v: Player) => {
+      const r = viewRadius(v.scope) + 200;
+      return (v.x - x) ** 2 + (v.y - y) ** 2 <= r * r;
+    };
     for (const p of this.players) {
       if (p.isBot || !p.connected) continue;
-      const v = this.viewPlayer(p);
-      const r = viewRadius(v.scope) + 200;
-      if ((v.x - x) ** 2 + (v.y - y) ** 2 <= r * r) p.events.push(e);
+      if (near(this.viewPlayer(p))) p.events.push(e);
+    }
+    for (const o of this.observers.values()) {
+      const v = this.players[o.watching];
+      if (v && near(v)) o.events.push(e);
     }
   }
 
@@ -1373,6 +1939,7 @@ export class Match {
       smoke: p.smoke,
       reloadLeft: p.reloadUntil > 0 ? Math.max(0, p.reloadUntil - now) : 0,
       healLeft: p.healUntil > 0 ? Math.max(0, p.healUntil - now) : 0,
+      fuseLeft: p.active === 'grenade' && p.grenadeFuseAt > 0 ? Math.max(0, Math.round(p.grenadeFuseAt - now)) : 0,
       kills: p.kills,
       damage: Math.round(p.damage),
       room: p.room,
@@ -1390,48 +1957,77 @@ export class Match {
 
   private sendSnapshots() {
     const z = this.zone;
-    const zoneNet: SnapshotMsg['z'] = [
-      Math.round(z.x), Math.round(z.y), Math.round(z.r), Math.round(z.tx), Math.round(z.ty), Math.round(z.tr),
-      z.phase, z.stage, Math.round(z.stageLeftMs), z.damagePerSecond,
-    ];
+    const lobby = this.lobbyArea;
+    // in the waiting area its circle stands in for the zone, so clients draw and map its edge for free
+    const zoneNet: SnapshotMsg['z'] = lobby
+      ? [Math.round(lobby.x), Math.round(lobby.y), Math.round(lobby.r), Math.round(lobby.x), Math.round(lobby.y), Math.round(lobby.r), 0, 'wait', Math.round(this.lobbyLeft), 0]
+      : [
+        Math.round(z.x), Math.round(z.y), Math.round(z.r), Math.round(z.tx), Math.round(z.ty), Math.round(z.tr),
+        z.phase, z.stage, Math.round(z.stageLeftMs), z.damagePerSecond,
+      ];
+    const lobbyNet: SnapshotMsg['lb'] = lobby
+      ? [Math.round(this.lobbyLeft), Math.round(lobby.x), Math.round(lobby.y), Math.round(lobby.r)]
+      : undefined;
     const smokes: SnapshotMsg['sm'] = this.smokes.map((s) => [s.id, Math.round(s.x), Math.round(s.y), Math.round(this.smokeRadius(s))]);
     const airdrops: AirdropNet[] = this.airdrops.map((a) => [
       a.id, Math.round(a.x), Math.round(a.y), this.now >= a.landAt ? 1 : 0, Math.max(0, Math.round(a.landAt - this.now)),
     ]);
     const alive = this.aliveCount;
+    const boars: BoarNet[] | undefined = this.training
+      ? this.boars.filter((b) => b.hp > 0).map((b) => [
+        b.id, Math.round(b.x), Math.round(b.y * 10) / 10, this.now < b.pauseUntil ? 0 : Math.round(b.dir * b.speed),
+        Math.ceil((b.hp / BOAR_HP) * 100),
+      ])
+      : undefined;
 
-    for (const c of this.players) {
-      if (c.isBot || !c.connected || !c.socket || c.left) continue;
-      const v = this.viewPlayer(c);
+    const team = this.isTeamMatch;
+    const aliveTeams = team ? this.aliveTeams : 0;
+    const mateNet = (p: Player): TeammateNet => [
+      p.pid, Math.round(p.x), Math.round(p.y), Math.ceil((p.hp / MAX_HP) * 100), p.alive ? 1 : 0, p.connected ? 0 : 1,
+    ];
+    // solo players are a team of one, so the same grouping keeps a marker private there
+    const markers = new Map<number, MarkerNet[]>();
+    for (const p of this.players) {
+      if (!p.marker || p.left) continue;
+      const list = markers.get(p.team) ?? [];
+      list.push([p.pid, p.marker.x, p.marker.y]);
+      markers.set(p.team, list);
+    }
+
+    /** What `viewer` gets when looking through `v`'s eyes; `self` is whose team, teammates and markers they see. */
+    const snapFor = (viewer: Player | Observer, v: Player, self: Player, seq: number, spectating: boolean): SnapshotMsg => {
       const radius = viewRadius(v.scope);
       const visiblePlayers: PlayerNet[] = [];
       for (const o of this.players) {
-        if (o.alive && this.canSee(v, o, radius)) visiblePlayers.push(this.playerNet(o));
+        if (!o.alive) continue;
+        // teammates in range show through walls and smoke
+        const mateInRange = team && o.team === self.team && (o.x - v.x) ** 2 + (o.y - v.y) ** 2 <= radius * radius;
+        if (mateInRange || this.canSee(v, o, radius)) visiblePlayers.push(this.playerNet(o));
       }
 
       const add: LootNet[] = [];
       const visibleLoot = new Set<number>();
       const lootRadius = radius + 100;
-      for (const l of this.loot.values()) {
+      if (!lobby) for (const l of this.loot.values()) {
         if (!this.canSeeLoot(v, l, lootRadius)) continue;
         visibleLoot.add(l.id);
-        if (!c.knownLoot.has(l.id)) add.push([l.id, l.item, Math.round(l.x), Math.round(l.y), l.amount]);
+        if (!viewer.knownLoot.has(l.id)) add.push([l.id, l.item, Math.round(l.x), Math.round(l.y), l.amount]);
       }
       const del: number[] = [];
-      for (const id of c.knownLoot) {
+      for (const id of viewer.knownLoot) {
         if (!visibleLoot.has(id)) del.push(id);
       }
-      c.knownLoot = visibleLoot;
+      viewer.knownLoot = visibleLoot;
 
       const throwables: SnapshotMsg['g'] = this.throwables
         .filter((t) => (t.x - v.x) ** 2 + (t.y - v.y) ** 2 < radius * radius)
         .map((t) => [t.id, t.kind, Math.round(t.x), Math.round(t.y)]);
 
       const snap: SnapshotMsg = {
-        t: this.now,
-        seq: c.lastSeq,
+        t: Math.round(this.now),
+        seq,
         me: this.selfNet(v),
-        spectating: v !== c,
+        spectating,
         p: visiblePlayers,
         g: throwables,
         sm: smokes,
@@ -1439,13 +2035,34 @@ export class Match {
         z: zoneNet,
         alive,
       };
+      if (team) {
+        snap.tm = this.players.filter((o) => o !== self && o.team === self.team).map(mateNet);
+        snap.teams = aliveTeams;
+      }
+      const mk = markers.get(self.team);
+      if (mk) snap.mk = mk;
       if (add.length) snap.la = add;
       if (del.length) snap.ld = del;
-      if (c.events.length) {
-        snap.e = c.events;
-        c.events = [];
+      if (lobbyNet) snap.lb = lobbyNet;
+      if (boars) {
+        snap.b = boars;
+        snap.tr = { ...this.trainingStats };
       }
-      c.socket.emit('snap', snap);
+      if (viewer.events.length) {
+        snap.e = viewer.events;
+        viewer.events = [];
+      }
+      return snap;
+    };
+
+    for (const c of this.players) {
+      if (c.isBot || !c.connected || !c.socket || c.left) continue;
+      const v = this.viewPlayer(c);
+      c.socket.emit('snap', snapFor(c, v, c, c.lastSeq, v !== c));
+    }
+    for (const o of this.observers.values()) {
+      const v = this.players[o.watching];
+      if (v) o.socket.emit('snap', snapFor(o, v, v, 0, true));
     }
   }
 

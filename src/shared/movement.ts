@@ -14,10 +14,23 @@ export function normalizeMove(mx: number, my: number): [number, number] {
   return [mx, my];
 }
 
+export interface MoveBounds {
+  x: number;
+  y: number;
+  r: number;
+}
+
+/** `bounds` keeps the player inside a circle (the pre-match waiting area); client and server must pass the same one. */
 export function stepMovement(
-  world: CollisionWorld, x: number, y: number, mx: number, my: number, speed: number, dt: number,
+  world: CollisionWorld, x: number, y: number, mx: number, my: number, speed: number, dt: number, bounds: MoveBounds | null = null,
 ): { x: number; y: number } {
   const [nx, ny] = normalizeMove(mx, my);
   if (nx === 0 && ny === 0) return { x, y };
-  return world.moveCircle(x, y, nx * speed * dt, ny * speed * dt, PLAYER_RADIUS);
+  const pos = world.moveCircle(x, y, nx * speed * dt, ny * speed * dt, PLAYER_RADIUS);
+  if (!bounds) return pos;
+  const max = bounds.r - PLAYER_RADIUS;
+  const d = Math.hypot(pos.x - bounds.x, pos.y - bounds.y);
+  if (d <= max) return pos;
+  const edge = { x: bounds.x + ((pos.x - bounds.x) / d) * max, y: bounds.y + ((pos.y - bounds.y) / d) * max };
+  return world.overlapsCircle(edge.x, edge.y, PLAYER_RADIUS) ? { x, y } : edge;
 }

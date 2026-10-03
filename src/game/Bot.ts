@@ -14,25 +14,42 @@ import {
   type AmmoType,
   type ItemId,
   type SlotName,
+  type Vec,
   type WeaponId,
 } from '../shared';
 import type { Loot, Match, Player } from './Match';
+
+/** Bots only pick fights with other bots this close (unless shot first), so a full map doesn't empty out in the first minute. */
+const BOT_VS_BOT_RANGE = 550;
 
 const BOT_NAMES = [
   'Sói Xám', 'Hổ Báo', 'Đại Bàng', 'Rồng Lửa', 'Báo Đêm', 'Cáo Già', 'Gấu Nâu', 'Kền Kền', 'Mèo Rừng',
   'Thợ Săn', 'Bóng Ma', 'Tia Chớp', 'Sấm Sét', 'Bão Cát', 'Rắn Hổ', 'Cá Mập', 'Diều Hâu', 'Lốc Xoáy',
 ];
 
-export function botNames(count: number): string[] {
+/** `count` distinct bot names not in `taken`; once the pool runs out names get a number suffix. */
+export function botNames(count: number, taken: ReadonlySet<string> = new Set()): string[] {
   const pool = [...BOT_NAMES].sort(() => Math.random() - 0.5);
-  return Array.from({ length: count }, (_, i) => `[BOT] ${pool[i % pool.length]}`);
+  const out: string[] = [];
+  for (let i = 0; out.length < count; i++) {
+    const round = Math.floor(i / pool.length);
+    const name = `[BOT] ${pool[i % pool.length]}${round ? ` ${round + 1}` : ''}`;
+    if (!taken.has(name)) out.push(name);
+  }
+  return out;
 }
 
 export class Bot {
   private target = -1;
   private targetSince = 0;
   private lootTarget = -1;
+  private lootDeadline = 0;
+  /** Loot this bot gave up on because a wall or obstacle kept it out of reach. */
+  private skippedLoot = new Set<number>();
   private chestTarget = -1;
+  private chestDeadline = 0;
+  /** Chests this bot could not break in time (out of reach, or nothing to hit them with). */
+  private skippedChests = new Set<number>();
   private destination: { x: number; y: number } | null = null;
   private nextThink = 0;
   private strafe = 1;
@@ -45,6 +62,9 @@ export class Bot {
   private nextStuckCheck = 0;
   private stuckUntil = 0;
   private stuckAngle = 0;
+  private path: Vec[] = [];
+  private pathGoal: Vec | null = null;
+  private pathAt = -Infinity;
   private throwing = 0;
   private readonly skill: number;
 
@@ -60,7 +80,9 @@ export class Bot {
 
   update(m: Match, p: Player) {
     const now = m.now;
-    if (now >= this.nextThink) {
+    // the pin is pulled on equip, so never keep a grenade in hand once the throw is done
+    if (this.throwing === 0 && p.active === 'grenade') m.holsterThrowable(p);
+    if (now >= this.nextThink && this.throwing === 0) {
       this.think(m, p);
       this.nextThink = now + 220 + this.rng() * 160;
     }
@@ -103,14 +125,20 @@ export class Bot {
       moveAngle = ang;
 
       const outside = Math.hypot(p.x - m.zone.x, p.y - m.zone.y) > m.zone.r - 30;
-      if (outside) moveAngle = Math.atan2(m.zone.y - p.y, m.zone.x - p.x);
+      if (outside) moveAngle = this.headFor(m, p, m.zone.x, m.zone.y);
 
       const ready = now - this.targetSince > this.reactionMs;
       if (ready && d <= range && this.hasLineOfSight(m, p, target.x, target.y, d)) p.fire = true;
     } else {
       this.aimError *= 0.9;
       let dest = this.destination;
-      if (this.chestTarget >= 0 && m.world.chestAlive[this.chestTarget]) {
+      if (this.chestTarget >= 0 && !m.world.chestAlive[this.chestTarget]) this.chestTarget = -1;
+      if (this.chestTarget >= 0 && now > this.chestDeadline) {
+        this.skippedChests.add(this.chestTarget);
+        this.chestTarget = -1;
+        this.nextThink = now;
+      }
+      if (this.chestTarget >= 0) {
         const c = m.map.chests[this.chestTarget];
         dest = { x: c.x, y: c.y };
         const r = chestRect(c);
@@ -119,7 +147,9 @@ export class Bot {
         const dd = Math.hypot(px - p.x, py - p.y);
         const def = WEAPONS[m.activeWeapon(p)];
         const reach = def.slot === 'melee' ? PLAYER_RADIUS + def.range - 6 : 260;
-        if (dd < reach) {
+        // a house wall between bot and chest would soak every shot, so walk in through the door instead
+        const hit = dd < reach ? m.world.raycast(p.x, p.y, c.x, c.y) : null;
+        if (hit && hit.collider.kind === 'chest' && hit.collider.id === c.id) {
           p.a = Math.atan2(c.y - p.y, c.x - p.x);
           p.fire = true;
           dest = null;
@@ -128,10 +158,19 @@ export class Bot {
         const l = m.loot.get(this.lootTarget);
         if (!l) {
           this.lootTarget = -1;
+        } else if (now > this.lootDeadline) {
+          if (this.skippedLoot.size > 40) this.skippedLoot.clear();
+          this.skippedLoot.add(l.id);
+          this.lootTarget = -1;
+          this.nextThink = now;
         } else {
           dest = { x: l.x, y: l.y };
-          if (Math.hypot(l.x - p.x, l.y - p.y) < PICKUP_RANGE - 15) {
-            m.interact(p);
+          if (Math.hypot(l.x - p.x, l.y - p.y) < PICKUP_RANGE - 15 && m.world.lineClear(p.x, p.y, l.x, l.y)) {
+            // interact() takes whatever is nearest (another item, a door), which can loop forever
+            if (!m.pickup(p, l, true)) {
+              if (this.skippedLoot.size > 40) this.skippedLoot.clear();
+              this.skippedLoot.add(l.id);
+            }
             this.lootTarget = -1;
             this.nextThink = now;
           }
@@ -139,7 +178,7 @@ export class Bot {
       }
       if (dest) {
         const d = Math.hypot(dest.x - p.x, dest.y - p.y);
-        if (d > 20) moveAngle = Math.atan2(dest.y - p.y, dest.x - p.x);
+        if (d > 20) moveAngle = this.headFor(m, p, dest.x, dest.y);
         else this.destination = null;
       }
       if (moveAngle !== null && !p.fire) p.a += angleDiff(p.a, moveAngle) * 0.25;
@@ -156,6 +195,7 @@ export class Bot {
       if (moved < 25) {
         this.stuckUntil = now + 700;
         this.stuckAngle = moveAngle + (this.rng() < 0.5 ? 1 : -1) * (Math.PI / 2 + this.rng());
+        this.pathAt = -Infinity;
         this.tryOpenDoor(m, p);
       }
       this.lastPos = { x: p.x, y: p.y };
@@ -178,10 +218,11 @@ export class Bot {
     let best: Player | null = null;
     let bestD = Infinity;
     for (const o of m.players) {
-      if (o === p || !o.alive || !m.canSee(p, o)) continue;
+      if (o === p || !o.alive || o.team === p.team || !m.canSee(p, o)) continue;
       const provoked = recentlyHurt && o.pid === this.lastAttacker;
       if (o.userId && now < BOT_HUMAN_GRACE_MS && !provoked) continue;
       let d = Math.hypot(o.x - p.x, o.y - p.y);
+      if (!o.userId && d > BOT_VS_BOT_RANGE && !provoked) continue;
       if (!hasGun && d > 220 && !(recentlyHurt && o.pid === this.lastAttacker)) continue;
       if (o.pid === this.lastAttacker && recentlyHurt) d *= 0.5;
       if (d < bestD) {
@@ -224,7 +265,7 @@ export class Bot {
     if (urgent) {
       this.lootTarget = -1;
       this.chestTarget = -1;
-      this.destination = this.randomPointIn(z.tx, z.ty, Math.max(40, z.tr * 0.6));
+      this.destination = this.randomPointIn(m.map.size, z.tx, z.ty, Math.max(40, z.tr * 0.6));
       return;
     }
 
@@ -232,7 +273,9 @@ export class Bot {
       let bestLoot: Loot | null = null;
       let bestScore = Infinity;
       const searchRadius = hasGun ? 650 : 1400;
+      let lootD = 0;
       for (const l of m.loot.values()) {
+        if (this.skippedLoot.has(l.id)) continue;
         const d = Math.hypot(l.x - p.x, l.y - p.y);
         if (d > searchRadius || (l.room !== -1 && l.room !== p.room && d > 260 && hasGun)) continue;
         const value = this.lootValue(p, l.item, cap);
@@ -241,23 +284,27 @@ export class Bot {
         if (score < bestScore) {
           bestScore = score;
           bestLoot = l;
+          lootD = d;
         }
       }
       this.lootTarget = bestLoot ? bestLoot.id : -1;
+      this.lootDeadline = now + 3000 + lootD * 8;
     }
 
     if (this.lootTarget < 0 && (this.chestTarget < 0 || !m.world.chestAlive[this.chestTarget])) {
       this.chestTarget = -1;
       for (const c of m.map.chests) {
-        if (m.world.chestAlive[c.id] && Math.hypot(c.x - p.x, c.y - p.y) < 380) {
+        const d = Math.hypot(c.x - p.x, c.y - p.y);
+        if (m.world.chestAlive[c.id] && !this.skippedChests.has(c.id) && d < 380) {
           this.chestTarget = c.id;
+          this.chestDeadline = now + 9000 + d * 10;
           break;
         }
       }
     }
 
     if (this.lootTarget < 0 && this.chestTarget < 0 && !this.destination) {
-      this.destination = this.randomPointIn(z.tx, z.ty, Math.max(60, z.tr * 0.85));
+      this.destination = this.randomPointIn(m.map.size, z.tx, z.ty, Math.max(60, z.tr * 0.85));
     }
   }
 
@@ -307,6 +354,20 @@ export class Bot {
     if (p.active !== 'melee') m.equip(p, 'melee');
   }
 
+  /** Heading toward the next waypoint on a path to (x, y); straight at it when no path exists. */
+  private headFor(m: Match, p: Player, x: number, y: number): number {
+    const now = m.now;
+    const g = this.pathGoal;
+    if (!g || Math.hypot(g.x - x, g.y - y) > 60 || now - this.pathAt > 4000) {
+      this.path = m.nav.findPath(p.x, p.y, x, y) ?? [];
+      this.pathGoal = { x, y };
+      this.pathAt = now;
+    }
+    while (this.path.length > 1 && Math.hypot(this.path[0].x - p.x, this.path[0].y - p.y) < 30) this.path.shift();
+    const wp = this.path[0] ?? { x, y };
+    return Math.atan2(wp.y - p.y, wp.x - p.x);
+  }
+
   private hasLineOfSight(m: Match, p: Player, tx: number, ty: number, d: number): boolean {
     const hit = m.world.raycast(p.x, p.y, tx, ty, true);
     return !hit || hit.t * d >= d - PLAYER_RADIUS;
@@ -333,9 +394,9 @@ export class Bot {
     }
   }
 
-  private randomPointIn(x: number, y: number, r: number) {
+  private randomPointIn(size: number, x: number, y: number, r: number) {
     const ang = this.rng() * Math.PI * 2;
     const d = Math.sqrt(this.rng()) * r;
-    return { x: clamp(x + Math.cos(ang) * d, 80, 4720), y: clamp(y + Math.sin(ang) * d, 80, 4720) };
+    return { x: clamp(x + Math.cos(ang) * d, 80, size - 80), y: clamp(y + Math.sin(ang) * d, 80, size - 80) };
   }
 }

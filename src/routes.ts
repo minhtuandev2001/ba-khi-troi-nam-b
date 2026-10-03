@@ -12,8 +12,10 @@ import {
   toPublicUser,
   touchLogin,
   updateAvatar,
+  updatePasswordHash,
 } from './db';
 import type { GameServer } from './game/GameServer';
+import { LoginGuard } from './security';
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -23,6 +25,19 @@ const authLimiter = rateLimit({
   message: { error: 'Bạn thử quá nhiều lần, vui lòng đợi 15 phút rồi thử lại.' },
 });
 
+/** Only successful sign-ups count, so typos in the form never use up the allowance. */
+const signupLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 5,
+  skipFailedRequests: true,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Mạng của bạn đã tạo nhiều tài khoản, vui lòng thử lại sau 1 giờ.' },
+});
+
+/** Real people need a few seconds to fill the form; scripted sign-ups submit almost instantly. */
+const MIN_SIGNUP_FILL_MS = 1500;
+
 const credentialsSchema = z.object({
   username: z.string().max(64),
   password: z.string().max(256),
@@ -30,19 +45,27 @@ const credentialsSchema = z.object({
 
 const registerSchema = credentialsSchema.extend({
   avatar: z.string().max(16).optional(),
+  /** Hidden honeypot input: people never see it, form-filling bots do. */
+  website: z.string().max(200).optional(),
+  fillMs: z.number().finite(),
 });
 
 export function createApiRouter(game: GameServer): Router {
   const router = Router();
+  const logins = new LoginGuard();
 
   router.get('/healthy', (_req, res) => {
     res.type('text/plain').send('ok');
   });
 
-  router.post('/auth/register', authLimiter, async (req, res) => {
+  router.post('/auth/register', authLimiter, signupLimiter, async (req, res) => {
     const parsed = registerSchema.safeParse(req.body);
-    if (!parsed.success) {
+    if (!parsed.success || parsed.data.website) {
       res.status(400).json({ error: 'Dữ liệu gửi lên không hợp lệ.' });
+      return;
+    }
+    if (parsed.data.fillMs < MIN_SIGNUP_FILL_MS) {
+      res.status(400).json({ error: 'Bạn thao tác quá nhanh, vui lòng thử lại.' });
       return;
     }
     const username = parsed.data.username.trim();
@@ -58,7 +81,7 @@ export function createApiRouter(game: GameServer): Router {
       res.status(409).json({ error: 'Tên đăng nhập đã có người sử dụng.' });
       return;
     }
-    res.status(201).json({ token: signToken(user.id), user: toPublicUser(user) });
+    res.status(201).json({ token: signToken(user.id, user.token_version), user: toPublicUser(user) });
   });
 
   router.post('/auth/login', authLimiter, async (req, res) => {
@@ -67,14 +90,26 @@ export function createApiRouter(game: GameServer): Router {
       res.status(400).json({ error: 'Dữ liệu gửi lên không hợp lệ.' });
       return;
     }
-    const user = await findUserByName(parsed.data.username.trim());
-    const ok = await verifyPassword(parsed.data.password, user?.password_hash ?? null);
-    if (!user || !ok) {
+    const username = parsed.data.username.trim();
+    const ip = req.ip ?? '';
+    const locked = logins.lockedFor(username, ip);
+    if (locked > 0) {
+      const minutes = Math.ceil(locked / 60_000);
+      res.setHeader('Retry-After', String(Math.ceil(locked / 1000)));
+      res.status(429).json({ error: `Bạn đã nhập sai mật khẩu tài khoản này nhiều lần nên tạm bị chặn đăng nhập trên mạng này. Thử lại sau ${minutes} phút.` });
+      return;
+    }
+    const user = await findUserByName(username);
+    const check = await verifyPassword(parsed.data.password, user?.password_hash ?? null);
+    if (!user || !check.ok) {
+      logins.failed(username, ip);
       res.status(401).json({ error: 'Sai tên đăng nhập hoặc mật khẩu.' });
       return;
     }
+    logins.succeeded(username, ip);
+    if (check.rehash) await updatePasswordHash(user.id, await hashPassword(parsed.data.password));
     await touchLogin(user.id);
-    res.json({ token: signToken(user.id), user: toPublicUser(user) });
+    res.json({ token: signToken(user.id, user.token_version), user: toPublicUser(user) });
   });
 
   router.get('/me', requireAuth, async (req, res) => {

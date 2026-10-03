@@ -2,6 +2,7 @@
   "name": "@game/backend",
   "version": "1.0.0",
   "private": true,
+  "license": "UNLICENSED",
   "type": "module",
   "engines": {
     "node": ">=22.9"
@@ -11,7 +12,10 @@
     "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node22 --packages=external --sourcemap --outfile=dist/index.js",
     "start": "node --env-file-if-exists=.env --enable-source-maps dist/index.js",
     "migrate": "tsx --env-file-if-exists=.env src/migrate.ts",
-    "typecheck": "tsc -p tsconfig.json"
+    "cleanup": "tsx --env-file-if-exists=.env src/cleanup.ts",
+    "db:reset": "tsx --env-file-if-exists=.env src/resetDb.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --env-file-if-exists=.env --import tsx --test --test-concurrency=1 test/*.test.ts"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
@@ -22,6 +26,7 @@
     "jsonwebtoken": "^9.0.3",
     "pg": "^8.23.1",
     "socket.io": "^4.8.4",
+    "socket.io-msgpack-parser": "^3.0.2",
     "zod": "^4.6.5"
   },
   "devDependencies": {
@@ -31,6 +36,7 @@
     "@types/node": "^22.18.0",
     "@types/pg": "^8.15.5",
     "esbuild": "^0.25.0",
+    "socket.io-client": "^4.8.4",
     "tsx": "^4.23.15",
     "typescript": "^5.9.2"
   }

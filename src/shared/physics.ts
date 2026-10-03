@@ -1,4 +1,3 @@
-import { MAP_SIZE } from './constants';
 import { clamp, segmentCircle, segmentRect, type Rect } from './geometry';
 import { chestRect, type GameMap } from './map';
 
@@ -26,7 +25,7 @@ export class CollisionWorld {
   private readonly marks = new Map<Collider, number>();
 
   constructor(readonly map: GameMap) {
-    this.cols = Math.ceil(MAP_SIZE / CELL);
+    this.cols = Math.ceil(map.size / CELL);
     this.cells = Array.from({ length: this.cols * this.cols }, () => []);
     this.doorOpen = map.doors.map(() => false);
     this.chestAlive = map.chests.map(() => true);
@@ -97,7 +96,7 @@ export class CollisionWorld {
         y = pushed.y;
       }
     }
-    return { x: clamp(x, r, MAP_SIZE - r), y: clamp(y, r, MAP_SIZE - r) };
+    return { x: clamp(x, r, this.map.size - r), y: clamp(y, r, this.map.size - r) };
   }
 
   private resolve(x: number, y: number, r: number): { x: number; y: number } {
@@ -152,6 +151,11 @@ export class CollisionWorld {
       if (t >= 0 && (!best || t < best.t)) best = { t, collider: c };
     }
     return best;
+  }
+
+  /** True when no active obstacle (wall, closed door, chest, tree, rock) lies between the two points. */
+  lineClear(x1: number, y1: number, x2: number, y2: number): boolean {
+    return !this.raycast(x1, y1, x2, y2);
   }
 }
 
