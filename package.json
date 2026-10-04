@@ -13,6 +13,7 @@
     "start": "node --env-file-if-exists=.env --enable-source-maps dist/index.js",
     "migrate": "tsx --env-file-if-exists=.env src/migrate.ts",
     "cleanup": "tsx --env-file-if-exists=.env src/cleanup.ts",
+    "scan:names": "tsx --env-file-if-exists=.env src/scanNames.ts",
     "db:reset": "tsx --env-file-if-exists=.env src/resetDb.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --env-file-if-exists=.env --import tsx --test --test-concurrency=1 test/*.test.ts"

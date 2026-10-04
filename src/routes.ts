@@ -1,8 +1,19 @@
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
-import { AVATARS, isUuid, sanitizeTouchLayouts, validatePassword, validateUsername } from './shared';
+import {
+  ADMIN_ACCOUNTS_PAGE,
+  AVATARS,
+  NAME_MAX_LENGTH,
+  isLeaderboardKind,
+  isUuid,
+  sanitizeTouchLayouts,
+  validatePassword,
+  validateUsername,
+  type AdminAccountList,
+} from './shared';
 import { hashPassword, requireAuth, signToken, verifyPassword } from './auth';
+import { getLeaderboard } from './leaderboard';
 import {
   createUser,
   findUserById,
@@ -10,6 +21,7 @@ import {
   getHistory,
   getStats,
   getTouchLayout,
+  listAccounts,
   setTouchLayout,
   toPublicUser,
   touchLogin,
@@ -178,6 +190,31 @@ export function createApiRouter(game: GameServer): Router {
     const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
     const offset = Math.max(0, Number(req.query.offset) || 0);
     res.json(await getHistory(req.userId!, limit, offset));
+  });
+
+  router.get('/leaderboard', requireAuth, async (req, res) => {
+    const kind = req.query.kind;
+    if (!isLeaderboardKind(kind)) {
+      res.status(400).json({ error: 'Bảng xếp hạng không hợp lệ.' });
+      return;
+    }
+    res.json(await getLeaderboard(kind, req.userId!));
+  });
+
+  router.get('/admin/accounts', requireAuth, async (req, res) => {
+    const me = await findUserById(req.userId!);
+    if (me?.role !== 'admin') {
+      res.status(403).json({ error: 'Chỉ quản trị viên mới xem được danh sách tài khoản.' });
+      return;
+    }
+    const raw = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    if (raw.length > NAME_MAX_LENGTH || !/^[A-Za-z0-9_]*$/.test(raw)) {
+      res.status(400).json({ error: 'Tên người chơi chỉ gồm chữ không dấu, số và dấu _.' });
+      return;
+    }
+    const { accounts, total } = await listAccounts(raw, ADMIN_ACCOUNTS_PAGE);
+    const body: AdminAccountList = { total, accounts: accounts.map((a) => ({ ...a, presence: game.presenceOf(a.id) })) };
+    res.json(body);
   });
 
   router.get('/rooms/:id', requireAuth, (req, res) => {

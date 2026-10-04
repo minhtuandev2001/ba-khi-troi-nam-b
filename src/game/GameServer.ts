@@ -24,6 +24,7 @@ import {
   isUuid,
   mapCapacity,
   resolveMapChoice,
+  validateRoomName,
   type ActionMsg,
   type GameMode,
   type LiveMatchSummary,
@@ -200,6 +201,26 @@ export class GameServer {
       party.profiles.set(user.id, user);
       this.broadcastParty(party);
     }
+  }
+
+  /** An admin deleted this account: it leaves its queue, party, room and match at once, and is disconnected. */
+  evictUser(userId: string) {
+    this.leaveQueue(userId, false);
+    this.leaveParty(userId, 'left');
+    this.leaveRoom(userId);
+    const match = this.userMatch.get(userId);
+    if (match) {
+      if (!match.ended) match.leave(match.pidOfUser(userId));
+      this.userMatch.delete(userId);
+      this.matchesChanged();
+    }
+    const o = this.online.get(userId);
+    if (o) {
+      o.socket.emit('account:deleted');
+      o.socket.disconnect(true);
+    }
+    // the disconnect would otherwise hold the (now empty) places for a reconnect that cannot happen
+    this.cancelLeave(userId);
   }
 
   roomInfo(id: string) {
@@ -797,16 +818,19 @@ export class GameServer {
   private createRoom(userId: string, opts: unknown) {
     const busy = this.isBusy(userId);
     if (busy) return this.emitError(userId, busy);
+    const req = typeof opts === 'object' && opts ? (opts as { teamSize?: unknown; name?: unknown; listed?: unknown }) : { teamSize: opts };
+    const name = cleanText(req.name, ROOM_NAME_MAX_LENGTH);
+    const nameError = validateRoomName(name);
+    if (nameError) return this.emitError(userId, nameError);
     if (this.rooms.size >= MAX_PRIVATE_ROOMS) return this.emitError(userId, 'Đã đạt số phòng tối đa, vui lòng thử lại sau.');
     const o = this.online.get(userId);
     if (!o) return;
     let hosted = 0;
     for (const r of this.rooms.values()) if (this.online.get(r.hostId)?.ip === o.ip) hosted++;
     if (hosted >= ROOMS_PER_IP) return this.emitError(userId, 'Mạng của bạn đang mở quá nhiều phòng chờ cùng lúc, hãy vào phòng có sẵn hoặc thử lại sau.');
-    const req = typeof opts === 'object' && opts ? (opts as { teamSize?: unknown; name?: unknown; listed?: unknown }) : { teamSize: opts };
     const room: PrivateRoom = {
       id: randomUUID(),
-      name: cleanText(req.name, ROOM_NAME_MAX_LENGTH) || `Phòng của ${o.user.username}`,
+      name: name || `Phòng của ${o.user.username}`,
       listed: req.listed !== false,
       createdAt: Date.now(),
       hostId: userId, humans: [userId], bots: [], profiles: new Map([[userId, o.user]]), map: DEFAULT_MAP,

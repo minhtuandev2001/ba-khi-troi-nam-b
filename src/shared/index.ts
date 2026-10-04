@@ -5,6 +5,7 @@ export * from './map';
 export * from './maps';
 export * from './movement';
 export * from './physics';
+export * from './profanity';
 export * from './progression';
 export * from './protocol';
 export * from './rng';

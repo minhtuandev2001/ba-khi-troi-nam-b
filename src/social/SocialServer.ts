@@ -8,6 +8,7 @@ import {
   dmChannel,
   isMuteMinutes,
   isUuid,
+  maskProfanity,
   supportChannel,
   supportOwner,
   type ChatChannel,
@@ -21,7 +22,8 @@ import {
   type SupportThread,
   type UserSearchResult,
 } from '../shared';
-import { findUserById } from '../db';
+import { deleteAccount, findUserById } from '../db';
+import { forgetLeaderboard } from '../leaderboard';
 import { TokenBucket } from '../game/rateLimit';
 import { clientIp } from '../security';
 import {
@@ -31,6 +33,7 @@ import {
   findSocialUserByName,
   friendIds,
   insertMessage,
+  linkedIds,
   listFriendships,
   markRead,
   removeFriendship,
@@ -43,9 +46,10 @@ import {
   unreadIn,
 } from './store';
 
-/** What the social layer needs to know from the game server. */
+/** What the social layer needs from the game server. */
 export interface PresenceSource {
   presenceOf(userId: string): Presence;
+  evictUser(userId: string): void;
 }
 
 const WORLD_ROOM = 'chat:world';
@@ -58,6 +62,11 @@ const SEARCH_RE = /^[A-Za-z0-9_]+$/;
 /** Unused rate-limit state is dropped after this long; every bucket has long refilled by then. */
 const LIMITS_IDLE_MS = 10 * 60_000;
 
+/** Messages the profanity filter had to mask, within the window, before an automatic chat ban. */
+const AUTO_MUTE_STRIKES = 3;
+const AUTO_MUTE_WINDOW_MS = 10 * 60_000;
+const AUTO_MUTE_MINUTES = 15;
+
 const fail = (error: string) => ({ ok: false, error }) as const;
 const TOO_FAST = 'Bạn thao tác quá nhanh, đợi một chút nhé.';
 
@@ -68,7 +77,16 @@ interface UserLimits {
   world: TokenBucket;
   direct: TokenBucket;
   lastWorld: { text: string; at: number };
+  /** When recent messages had words masked (the automatic chat ban counts them). */
+  strikes: number[];
   seenAt: number;
+}
+
+function withoutRaw(message: ChatMessage): ChatMessage {
+  if (!message.raw) return message;
+  const copy = { ...message };
+  delete copy.raw;
+  return copy;
 }
 
 function timeLeft(until: Date): string {
@@ -100,6 +118,7 @@ export class SocialServer {
         world: new TokenBucket(3, 0.5),
         direct: new TokenBucket(8, 1.5),
         lastWorld: { text: '', at: 0 },
+        strikes: [],
         seenAt: Date.now(),
       };
       this.limits.set(userId, l);
@@ -113,6 +132,36 @@ export class SocialServer {
     if (!l) this.ipWorld.set(ip, (l = { bucket: new TokenBucket(8, 1), seenAt: 0 }));
     l.seenAt = Date.now();
     return l.bucket.take();
+  }
+
+  /** A new message to every socket in `target` but the sender's; only admins receive the unmasked text. */
+  private deliver(socket: Socket, target: string | string[], message: ChatMessage) {
+    if (!message.raw) {
+      socket.to(target).emit('chat:msg', message);
+      return;
+    }
+    socket.to(target).except(ADMIN_ROOM).emit('chat:msg', withoutRaw(message));
+    const rooms = this.io.sockets.adapter.rooms;
+    const targets = Array.isArray(target) ? target : [target];
+    for (const id of rooms.get(ADMIN_ROOM) ?? []) {
+      if (id !== socket.id && targets.some((r) => rooms.get(r)?.has(id))) this.io.to(id).emit('chat:msg', message);
+    }
+  }
+
+  /** Counts a masked message; enough of them in a short while ban the player from chat. Returns the sender's warning ('' once banned). */
+  private async strike(userId: string, limits: UserLimits): Promise<string> {
+    const now = Date.now();
+    limits.strikes = limits.strikes.filter((t) => now - t < AUTO_MUTE_WINDOW_MS);
+    limits.strikes.push(now);
+    const left = AUTO_MUTE_STRIKES - limits.strikes.length;
+    if (left > 0) {
+      return `Tin nhắn có từ ngữ không phù hợp nên đã bị che. Thêm ${left} lần nữa trong ${AUTO_MUTE_WINDOW_MS / 60_000} phút sẽ bị tự động cấm chat ${AUTO_MUTE_MINUTES} phút.`;
+    }
+    limits.strikes = [];
+    const result = await setChatMute(userId, AUTO_MUTE_MINUTES);
+    this.io.to(userRoom(userId)).emit('chat:muted', { until: result?.until?.toISOString() ?? null, auto: true });
+    console.log(`[automod] cấm chat ${result?.username ?? userId} ${AUTO_MUTE_MINUTES} phút vì dùng từ ngữ không phù hợp ${AUTO_MUTE_STRIKES} lần`);
+    return '';
   }
 
   /** Wires the social events for a freshly connected socket; `me` returns the latest profile. */
@@ -162,7 +211,7 @@ export class SocialServer {
     };
     const isChannel = (c: string): c is ChatChannel => c === WORLD_CHANNEL || c.startsWith('dm:') || c.startsWith('support:');
 
-    handle<{ message: ChatMessage }>('chat:send', async ({ to, text }) => {
+    handle<{ message: ChatMessage; warn?: string }>('chat:send', async ({ to, text }) => {
       const body = cleanChatText(text);
       if (!body) return fail('Tin nhắn trống.');
       const channel = await channelFor(to);
@@ -184,18 +233,21 @@ export class SocialServer {
       }
       const u = me();
       const from = { id: u.id, username: u.username, avatar: u.avatar, level: u.level, ...(u.role === 'admin' ? { admin: true } : {}) };
-      const message = await insertMessage(channel, from, body);
+      const masked = maskProfanity(body);
+      const message = await insertMessage(channel, from, masked.text, masked.hits ? body : undefined);
       // a support thread reaches its player and every admin; socket.to leaves out the sender
       const target = channel === WORLD_CHANNEL ? WORLD_ROOM : owner ? [userRoom(owner), ADMIN_ROOM] : userRoom(to as string);
-      socket.to(target).emit('chat:msg', message);
-      return { ok: true, message };
+      this.deliver(socket, target, message);
+      // talking to the admins about a ban never counts towards one
+      const warn = masked.hits && !owner && !isAdmin() ? await this.strike(userId, limits) : '';
+      return { ok: true, message: isAdmin() ? message : withoutRaw(message), ...(warn ? { warn } : {}) };
     }, limits.send);
 
     handle<{ messages: ChatMessage[] }>('chat:history', async ({ to, before }) => {
       const channel = await channelFor(to);
       if (!isChannel(channel)) return fail(channel);
       const cursor = typeof before === 'string' && /^\d{1,18}$/.test(before) ? before : null;
-      return { ok: true, messages: await channelHistory(channel, cursor) };
+      return { ok: true, messages: await channelHistory(channel, cursor, isAdmin()) };
     });
 
     handle<object>('chat:read', async ({ to, id }) => {
@@ -239,6 +291,24 @@ export class SocialServer {
       this.io.to(userRoom(target)).emit('chat:muted', { until });
       console.log(`[admin] ${me().username} ${minutes ? `cấm chat ${result.username} ${minutes} phút` : `bỏ cấm chat ${result.username}`}`);
       return { ok: true, until };
+    });
+
+    handle<{ username: string }>('admin:deleteUser', async ({ userId: target }) => {
+      if (!isAdmin()) return fail('Chỉ quản trị viên mới xoá được tài khoản.');
+      if (!isUuid(target) || target === userId) return fail('Người chơi không hợp lệ.');
+      const player = await findUserById(target);
+      if (!player) return fail('Không tìm thấy người chơi này.');
+      if (player.role === 'admin') return fail('Không xoá được tài khoản quản trị viên.');
+      const linked = await linkedIds(target);
+      const removed = await deleteAccount(target);
+      if (!removed) return fail('Không tìm thấy người chơi này.');
+      this.presence.evictUser(target);
+      this.limits.delete(target);
+      forgetLeaderboard();
+      if (linked.length) this.notifyFriendsChanged(...linked);
+      this.io.emit('chat:purge', { userId: target });
+      console.log(`[admin] ${me().username} xoá tài khoản ${removed.username}`);
+      return { ok: true, username: removed.username };
     });
 
     handle<{ result: 'sent' | 'accepted' }>('friend:request', async ({ username, userId: targetId }) => {

@@ -103,6 +103,16 @@ export async function friendIds(me: string): Promise<string[]> {
   return rows.map((r) => r.id);
 }
 
+/** Everyone with a friendship or a pending request either way. */
+export async function linkedIds(me: string): Promise<string[]> {
+  const { rows } = await pool.query<{ id: string }>(
+    `SELECT CASE WHEN requester_id = $1 THEN addressee_id ELSE requester_id END AS id
+       FROM friendships WHERE requester_id = $1 OR addressee_id = $1`,
+    [me],
+  );
+  return rows.map((r) => r.id);
+}
+
 export async function areFriends(a: string, b: string): Promise<boolean> {
   const { rows } = await pool.query(`SELECT 1 FROM friendships WHERE ${PAIR} AND status = 'accepted'`, [a, b]);
   return rows.length > 0;
@@ -153,25 +163,28 @@ export async function removeFriendship(me: string, other: string): Promise<boole
   return (rowCount ?? 0) > 0;
 }
 
-export async function insertMessage(channel: ChatChannel, from: SocialUser, text: string): Promise<ChatMessage> {
+/** `raw`: the unmasked text, kept only when the filter changed it. */
+export async function insertMessage(channel: ChatChannel, from: SocialUser, text: string, raw?: string): Promise<ChatMessage> {
   const { rows } = await pool.query<{ id: string; created_at: Date }>(
-    'INSERT INTO chat_messages (channel, sender_id, body) VALUES ($1, $2, $3) RETURNING id::text, created_at',
-    [channel, from.id, text],
+    'INSERT INTO chat_messages (channel, sender_id, body, raw_body) VALUES ($1, $2, $3, $4) RETURNING id::text, created_at',
+    [channel, from.id, text, raw ?? null],
   );
-  return { id: rows[0].id, channel, from, text, at: rows[0].created_at.toISOString() };
+  return { id: rows[0].id, channel, from, text, ...(raw ? { raw } : {}), at: rows[0].created_at.toISOString() };
 }
 
-/** Newest page of a channel (or the page before message `before`), oldest first. */
-export async function channelHistory(channel: ChatChannel, before: string | null, limit = CHAT_PAGE_SIZE): Promise<ChatMessage[]> {
-  const { rows } = await pool.query<UserCols & { msg_id: string; body: string; created_at: Date }>(
-    `SELECT m.id::text AS msg_id, m.body, m.created_at, u.id, u.username, u.avatar, u.xp, u.role
+/** Newest page of a channel (or the page before message `before`), oldest first; `withRaw` keeps the unmasked text (admins). */
+export async function channelHistory(channel: ChatChannel, before: string | null, withRaw = false, limit = CHAT_PAGE_SIZE): Promise<ChatMessage[]> {
+  const { rows } = await pool.query<UserCols & { msg_id: string; body: string; raw_body: string | null; created_at: Date }>(
+    `SELECT m.id::text AS msg_id, m.body, m.raw_body, m.created_at, u.id, u.username, u.avatar, u.xp, u.role
        FROM chat_messages m JOIN users u ON u.id = m.sender_id
       WHERE m.channel = $1 AND ($2::bigint IS NULL OR m.id < $2::bigint)
       ORDER BY m.id DESC
       LIMIT $3`,
     [channel, before, limit],
   );
-  return rows.reverse().map((r) => ({ id: r.msg_id, channel, from: toSocialUser(r), text: r.body, at: r.created_at.toISOString() }));
+  return rows.reverse().map((r) => ({
+    id: r.msg_id, channel, from: toSocialUser(r), text: r.body, ...(withRaw && r.raw_body ? { raw: r.raw_body } : {}), at: r.created_at.toISOString(),
+  }));
 }
 
 export async function markRead(me: string, channel: ChatChannel, messageId: string): Promise<void> {

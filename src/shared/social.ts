@@ -85,7 +85,10 @@ export interface ChatMessage {
   id: string;
   channel: ChatChannel;
   from: SocialUser;
+  /** With bad words already masked (`maskProfanity`). */
   text: string;
+  /** Only sent to admins, and only when the filter masked something: what the sender actually typed. */
+  raw?: string;
   at: string;
 }
 
@@ -107,6 +110,23 @@ export interface UserSearchResult extends SocialUser {
   /** Only sent to admins: when the player's chat ban ends, if they have one. */
   mutedUntil?: string;
 }
+
+/** A row of the admin accounts page (`GET /api/admin/accounts`). */
+export interface AdminAccount extends SocialUser {
+  createdAt: string;
+  lastLoginAt: string | null;
+  matches: number;
+  mutedUntil: string | null;
+  presence: Presence;
+}
+
+export interface AdminAccountList {
+  accounts: AdminAccount[];
+  /** Every account matching the search; `accounts` holds at most the newest `ADMIN_ACCOUNTS_PAGE`. */
+  total: number;
+}
+
+export const ADMIN_ACCOUNTS_PAGE = 50;
 
 /** A player's side of the support chat (`support:status`). */
 export interface SupportStatus {

@@ -1,9 +1,13 @@
 import pg from 'pg';
 import {
   isMapId,
+  LEADERBOARD_MIN_MATCHES,
   levelFromXp,
   sanitizeTouchLayouts,
+  type AdminAccount,
   type GameMode,
+  type LeaderboardKind,
+  type RankEntry,
   type TouchLayouts,
   type MapId,
   type MatchHistoryEntry,
@@ -209,6 +213,66 @@ export async function findUserById(id: string): Promise<UserRow | null> {
   return rows[0] ?? null;
 }
 
+/** The admin accounts page: newest first, optionally only names containing `query` (letters, digits and _). */
+export async function listAccounts(query: string, limit: number): Promise<{ accounts: Omit<AdminAccount, 'presence'>[]; total: number }> {
+  const pattern = `%${query.toLowerCase().replace(/_/g, '\\_')}%`;
+  const { rows } = await pool.query<{
+    id: string; username: string; avatar: string; xp: number; role: UserRole; created_at: Date; last_login_at: Date | null;
+    chat_muted_until: Date | null; matches: number; total: number;
+  }>(
+    `SELECT u.id, u.username, u.avatar, u.xp, u.role, u.created_at, u.last_login_at,
+            CASE WHEN u.chat_muted_until > now() THEN u.chat_muted_until END AS chat_muted_until,
+            (SELECT count(*)::int FROM match_players mp WHERE mp.user_id = u.id) + coalesce(a.matches, 0) AS matches,
+            count(*) OVER ()::int AS total
+       FROM users u LEFT JOIN user_stats_archive a ON a.user_id = u.id
+      WHERE lower(u.username) LIKE $1
+      ORDER BY u.created_at DESC
+      LIMIT $2`,
+    [pattern, limit],
+  );
+  return {
+    total: rows[0]?.total ?? 0,
+    accounts: rows.map((r) => ({
+      id: r.id,
+      username: r.username,
+      avatar: r.avatar,
+      level: levelFromXp(r.xp),
+      ...(r.role === 'admin' ? { admin: true } : {}),
+      createdAt: r.created_at.toISOString(),
+      lastLoginAt: r.last_login_at?.toISOString() ?? null,
+      matches: r.matches,
+      mutedUntil: r.chat_muted_until?.toISOString() ?? null,
+    })),
+  };
+}
+
+/**
+ * Deletes a player's account and everything tied to it (the foreign keys cascade), plus what others wrote to them
+ * in DMs and the support thread, which no key ties to the account. Admin accounts are never deleted.
+ */
+export async function deleteAccount(id: string): Promise<{ username: string } | null> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query<{ username: string }>(
+      "DELETE FROM users WHERE id = $1 AND role <> 'admin' RETURNING username",
+      [id],
+    );
+    if (rows[0]) {
+      const threads = [`support:${id}`, `dm:%${id}%`];
+      await client.query('DELETE FROM chat_messages WHERE channel = $1 OR channel LIKE $2', threads);
+      await client.query('DELETE FROM chat_reads WHERE channel = $1 OR channel LIKE $2', threads);
+    }
+    await client.query('COMMIT');
+    return rows[0] ?? null;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 /** Returns null when the username is already taken. */
 export async function createUser(username: string, passwordHash: string, avatar: string): Promise<UserRow | null> {
   try {
@@ -284,6 +348,52 @@ export async function getStats(userId: string): Promise<UserStats> {
   };
 }
 
+/** Score and entry rule of each board; the averages and ratios need LEADERBOARD_MIN_MATCHES matches. */
+const BOARD_SQL: Record<LeaderboardKind, { value: string; where: string }> = {
+  kills: { value: 'kills', where: 'kills > 0' },
+  level: { value: 'xp', where: 'xp > 0' },
+  survival: { value: 'survival_sum / matches', where: 'matches >= $1' },
+  kd: { value: 'kills::float / GREATEST(1, matches - wins)', where: 'matches >= $1' },
+  winrate: { value: 'wins::float / matches', where: 'matches >= $1' },
+};
+
+/** Every qualifying player of one board, best first, with lifetime totals (kept history plus the archived part). */
+export async function rankPlayers(kind: LeaderboardKind): Promise<RankEntry[]> {
+  const board = BOARD_SQL[kind];
+  const { rows } = await pool.query(
+    `WITH live AS (
+       SELECT user_id, count(*) AS matches, count(*) FILTER (WHERE placement = 1) AS wins,
+              sum(kills) AS kills, sum(survival_ms) AS survival_sum
+         FROM match_players GROUP BY user_id
+     ), totals AS (
+       SELECT u.id, u.username, u.avatar, u.xp, u.role,
+              (coalesce(l.matches, 0) + coalesce(a.matches, 0))::int AS matches,
+              (coalesce(l.wins, 0) + coalesce(a.wins, 0))::int AS wins,
+              (coalesce(l.kills, 0) + coalesce(a.kills, 0))::int AS kills,
+              (coalesce(l.survival_sum, 0) + coalesce(a.survival_sum, 0))::float AS survival_sum
+         FROM users u
+         LEFT JOIN live l ON l.user_id = u.id
+         LEFT JOIN user_stats_archive a ON a.user_id = u.id
+     ), scored AS (
+       SELECT *, (${board.value})::float AS value FROM totals WHERE ${board.where} AND $1::int > 0
+     )
+     SELECT id, username, avatar, xp, role, matches, value, rank() OVER (ORDER BY value DESC)::int AS rank
+       FROM scored
+      ORDER BY value DESC, matches DESC, lower(username)`,
+    [LEADERBOARD_MIN_MATCHES],
+  );
+  return rows.map((r) => ({
+    rank: r.rank,
+    id: r.id,
+    username: r.username,
+    avatar: r.avatar,
+    admin: r.role === 'admin',
+    level: levelFromXp(r.xp),
+    matches: r.matches,
+    value: r.value,
+  }));
+}
+
 export async function getHistory(userId: string, limit: number, offset: number): Promise<{ items: MatchHistoryEntry[]; total: number }> {
   const [list, count] = await Promise.all([
     pool.query(
@@ -340,9 +450,10 @@ async function saveMatchOnce(m: MatchRecord): Promise<void> {
       [m.id, m.mode, m.mapId, m.playerCount, m.teamSize, m.winnerName, m.startedAt, m.endedAt, m.endedAt.getTime() - m.startedAt.getTime()],
     );
     for (const p of m.players) {
+      // an account an admin deleted mid-match is skipped, so the others still get their result
       await client.query(
         `INSERT INTO match_players (match_id, user_id, placement, kills, damage, survival_ms, xp_gained)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+         SELECT $1::uuid, $2::uuid, $3::int, $4::int, $5::int, $6::int, $7::int WHERE EXISTS (SELECT 1 FROM users WHERE id = $2::uuid)`,
         [m.id, p.userId, p.placement, p.kills, Math.round(p.damage), Math.round(p.survivalMs), p.xpGained],
       );
       await client.query('UPDATE users SET xp = xp + $2 WHERE id = $1', [p.userId, p.xpGained]);

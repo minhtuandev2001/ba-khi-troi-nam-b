@@ -3,6 +3,7 @@ import * as adminAccount from './001_admin_account';
 import * as retention from './002_retention';
 import * as security from './003_security';
 import * as touchLayout from './004_touch_layout';
+import * as chatFilter from './005_chat_filter';
 
 export interface Migration {
   /** Recorded in `schema_migrations` once applied; never rename or reorder a released one. */
@@ -16,4 +17,5 @@ export const MIGRATIONS: Migration[] = [
   { id: '002_retention', up: retention.up },
   { id: '003_security', up: security.up },
   { id: '004_touch_layout', up: touchLayout.up },
+  { id: '005_chat_filter', up: chatFilter.up },
 ];

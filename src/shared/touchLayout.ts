@@ -1,5 +1,5 @@
 /** On-screen buttons a phone or tablet player can move and resize. */
-export const TOUCH_BUTTONS = ['heal', 'reload', 'interact', 'smoke', 'grenade', 'pause', 'scope', 'map', 'inventory'] as const;
+export const TOUCH_BUTTONS = ['fire', 'heal', 'reload', 'interact', 'smoke', 'grenade', 'pause', 'scope', 'map', 'inventory'] as const;
 export type TouchButtonId = (typeof TOUCH_BUTTONS)[number];
 
 /**

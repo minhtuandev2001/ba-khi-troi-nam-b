@@ -1,4 +1,5 @@
 import { NAME_MAX_LENGTH, NAME_MIN_LENGTH, PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from './constants';
+import { nameHasProfanity, textHasProfanity } from './profanity';
 
 const USERNAME_RE = /^[A-Za-z][A-Za-z0-9_]*$/;
 const RESERVED = ['admin', 'administrator', 'root', 'system', 'bot', 'moderator', 'support'];
@@ -15,7 +16,16 @@ export function validateUsername(name: unknown): string[] {
   if (RESERVED.some((r) => name.toLowerCase().startsWith(r))) {
     errors.push('Tên đăng nhập này đã được hệ thống giữ lại, hãy chọn tên khác.');
   }
+  if (nameHasProfanity(name)) errors.push(NAME_PROFANE);
   return errors;
+}
+
+const NAME_PROFANE = 'Tên đăng nhập chứa từ ngữ không phù hợp, hãy chọn tên khác.';
+export const ROOM_NAME_PROFANE = 'Tên phòng chứa từ ngữ không phù hợp, hãy đặt tên khác.';
+
+/** Room names are free text shown in the public room list; '' (the default name) is fine. */
+export function validateRoomName(name: string): string | null {
+  return name && textHasProfanity(name) ? ROOM_NAME_PROFANE : null;
 }
 
 export function validatePassword(password: unknown, username = ''): string[] {
