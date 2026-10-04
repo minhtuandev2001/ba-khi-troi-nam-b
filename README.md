@@ -28,6 +28,7 @@ Cơ sở dữ liệu được cập nhật tự động khi server khởi độn
 | `001_admin_account` | Thêm cột `users.role` (`user` hoặc `admin`) |
 | `002_retention` | Bảng `user_stats_archive` (thống kê cộng dồn của các trận đã bị job dọn dữ liệu xoá) và `job_runs` (lần chạy gần nhất của job) |
 | `003_security` | Thêm cột `users.token_version` (tăng lên để thu hồi mọi token đã cấp của tài khoản) và `users.chat_muted_until` (admin cấm chat đến thời điểm này) |
+| `004_touch_layout` | Thêm cột `users.touch_layout` (`jsonb`, bố cục nút cảm ứng người chơi tự chỉnh; `NULL` là dùng bố cục mặc định) |
 
 ### Dọn dữ liệu mỗi ngày
 
@@ -56,7 +57,7 @@ Job trong `src/retention.ts` chạy **24 giờ một lần** để database khô
 
 Kiểm tra kiểu: `npm run typecheck`.
 
-Test (chat/bạn bè, chat hỗ trợ với admin, admin cấm chat và các giới hạn chống spam, giới hạn trận/phòng theo mạng, khoá đăng nhập, mật khẩu admin, phòng tập treo máy, nhóm ghép trận, phòng chia đội, danh sách phòng ở sảnh, migration và tài khoản admin, phòng chờ đầu trận, nhặt đồ, bot chọn mục tiêu, cờ đánh dấu, xem trận sau khi bị loại, admin xem trận và kích người chơi, job dọn dữ liệu và các hàm ghép đội): `npm test`, chạy khi server dev đang bật. Test tự tạo tài khoản và tin nhắn tạm rồi xoá sạch sau khi chạy. Test job dọn dữ liệu chạy job thật nên cũng dọn dữ liệu của mọi tài khoản trên database dev, như job hằng ngày vẫn làm. Test admin kết nối bằng tài khoản `admin` (tạm đổi mật khẩu rồi trả lại như cũ), nên phiên admin đang mở trên trình duyệt sẽ bị đẩy ra. Mọi client test kết nối từ cùng một máy nên dùng chung các giới hạn theo IP; chạy hai lần sát nhau có thể vướng giới hạn kết nối socket, đợi khoảng một phút rồi chạy lại.
+Test (chat/bạn bè, chat hỗ trợ với admin, admin cấm chat và các giới hạn chống spam, giới hạn trận/phòng theo mạng, khoá đăng nhập, mật khẩu admin, phòng tập treo máy, nhóm ghép trận, phòng chia đội, danh sách phòng ở sảnh, migration và tài khoản admin, phòng chờ đầu trận, nhặt đồ, bot chọn mục tiêu, cờ đánh dấu, xem trận sau khi bị loại, admin xem trận và kích người chơi, job dọn dữ liệu, các hàm ghép đội và lưu bố cục nút cảm ứng): `npm test`, chạy khi server dev đang bật. Test tự tạo tài khoản và tin nhắn tạm rồi xoá sạch sau khi chạy. Test job dọn dữ liệu chạy job thật nên cũng dọn dữ liệu của mọi tài khoản trên database dev, như job hằng ngày vẫn làm. Test admin kết nối bằng tài khoản `admin` (tạm đổi mật khẩu rồi trả lại như cũ), nên phiên admin đang mở trên trình duyệt sẽ bị đẩy ra. Mọi client test kết nối từ cùng một máy nên dùng chung các giới hạn theo IP; chạy hai lần sát nhau có thể vướng giới hạn kết nối socket, đợi khoảng một phút rồi chạy lại.
 
 ## Deploy
 
@@ -87,11 +88,11 @@ Bước build cần các gói devDependencies (`esbuild`, `typescript`), nên đ
 
 ```
 src/index.ts        Express + Socket.IO, CORS, helmet
-src/routes.ts       REST: /api/auth/register, /api/auth/login, /api/me, /api/me/stats, /api/me/history, /api/rooms/:id
+src/routes.ts       REST: /api/auth/register, /api/auth/login, /api/me, /api/me/stats, /api/me/history, /api/me/touch-layout, /api/rooms/:id
 src/security.ts     khoá đăng nhập theo tài khoản + IP, giới hạn kết nối socket theo IP, bắt buộc HTTPS
 src/db.ts           PostgreSQL: schema gốc, chạy migration, truy vấn, lưu kết quả trận (có thử lại khi mất kết nối)
 src/retention.ts    job dọn dữ liệu mỗi 24 giờ (lịch sử trận, chat thế giới, tin nhắn riêng, chat hỗ trợ); src/cleanup.ts chạy tay
-src/migrations/     migration đánh số, mỗi cái chạy một lần (001: vai trò người dùng, 002: lưu trữ thống kê, 003: thu hồi token và cấm chat)
+src/migrations/     migration đánh số, mỗi cái chạy một lần (001: vai trò người dùng, 002: lưu trữ thống kê, 003: thu hồi token và cấm chat, 004: bố cục nút cảm ứng)
 src/adminAccount.ts tạo tài khoản admin hoặc đổi mật khẩu theo ADMIN_PASSWORD, chạy mỗi lần khởi động
 src/auth.ts         băm mật khẩu scrypt, JWT (kèm token_version để thu hồi)
 src/game/GameServer.ts  xác thực socket, ghép trận, nhóm, chế độ bot, phòng bạn bè, kết nối lại

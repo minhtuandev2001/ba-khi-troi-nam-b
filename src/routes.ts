@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
-import { AVATARS, isUuid, validatePassword, validateUsername } from './shared';
+import { AVATARS, isUuid, sanitizeTouchLayouts, validatePassword, validateUsername } from './shared';
 import { hashPassword, requireAuth, signToken, verifyPassword } from './auth';
 import {
   createUser,
@@ -9,6 +9,8 @@ import {
   findUserByName,
   getHistory,
   getStats,
+  getTouchLayout,
+  setTouchLayout,
   toPublicUser,
   touchLogin,
   updateAvatar,
@@ -33,6 +35,15 @@ const signupLimiter = rateLimit({
   standardHeaders: 'draft-8',
   legacyHeaders: false,
   message: { error: 'Mạng của bạn đã tạo nhiều tài khoản, vui lòng thử lại sau 1 giờ.' },
+});
+
+/** Saving happens once per press of "Lưu" in the button editor, so this only stops scripts hammering the column. */
+const layoutLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Bạn lưu bố cục nút quá nhiều lần, vui lòng đợi một phút.' },
 });
 
 /** Real people need a few seconds to fill the form; scripted sign-ups submit almost instantly. */
@@ -134,6 +145,29 @@ export function createApiRouter(game: GameServer): Router {
     }
     game.refreshUser(toPublicUser(user));
     res.json({ user: toPublicUser(user) });
+  });
+
+  router.get('/me/touch-layout', requireAuth, async (req, res) => {
+    const layouts = await getTouchLayout(req.userId!);
+    if (!layouts) {
+      res.status(404).json({ error: 'Tài khoản không tồn tại.' });
+      return;
+    }
+    res.json({ layouts });
+  });
+
+  router.put('/me/touch-layout', requireAuth, layoutLimiter, async (req, res) => {
+    const raw = (req.body as { layouts?: unknown })?.layouts;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      res.status(400).json({ error: 'Bố cục nút không hợp lệ.' });
+      return;
+    }
+    const layouts = sanitizeTouchLayouts(raw);
+    if (!(await setTouchLayout(req.userId!, layouts))) {
+      res.status(404).json({ error: 'Tài khoản không tồn tại.' });
+      return;
+    }
+    res.json({ layouts });
   });
 
   router.get('/me/stats', requireAuth, async (req, res) => {

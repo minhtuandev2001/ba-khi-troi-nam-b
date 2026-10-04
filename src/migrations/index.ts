@@ -2,6 +2,7 @@ import type { PoolClient } from 'pg';
 import * as adminAccount from './001_admin_account';
 import * as retention from './002_retention';
 import * as security from './003_security';
+import * as touchLayout from './004_touch_layout';
 
 export interface Migration {
   /** Recorded in `schema_migrations` once applied; never rename or reorder a released one. */
@@ -14,4 +15,5 @@ export const MIGRATIONS: Migration[] = [
   { id: '001_admin_account', up: adminAccount.up },
   { id: '002_retention', up: retention.up },
   { id: '003_security', up: security.up },
+  { id: '004_touch_layout', up: touchLayout.up },
 ];

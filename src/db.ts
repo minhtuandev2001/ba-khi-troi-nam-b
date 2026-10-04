@@ -2,7 +2,9 @@ import pg from 'pg';
 import {
   isMapId,
   levelFromXp,
+  sanitizeTouchLayouts,
   type GameMode,
+  type TouchLayouts,
   type MapId,
   type MatchHistoryEntry,
   type PublicUser,
@@ -232,6 +234,19 @@ export async function updatePasswordHash(id: string, passwordHash: string): Prom
 export async function updateAvatar(id: string, avatar: string): Promise<UserRow | null> {
   const { rows } = await pool.query<UserRow>('UPDATE users SET avatar = $2 WHERE id = $1 RETURNING *', [id, avatar]);
   return rows[0] ?? null;
+}
+
+/** Null when the account does not exist. */
+export async function getTouchLayout(id: string): Promise<TouchLayouts | null> {
+  const { rows } = await pool.query<{ touch_layout: unknown }>('SELECT touch_layout FROM users WHERE id = $1', [id]);
+  return rows.length ? sanitizeTouchLayouts(rows[0].touch_layout) : null;
+}
+
+/** An empty arrangement clears the column, so the defaults apply again. Returns false when the account is gone. */
+export async function setTouchLayout(id: string, layouts: TouchLayouts): Promise<boolean> {
+  const value = Object.keys(layouts).length ? JSON.stringify(layouts) : null;
+  const { rowCount } = await pool.query('UPDATE users SET touch_layout = $2 WHERE id = $1', [id, value]);
+  return (rowCount ?? 0) > 0;
 }
 
 /** Lifetime stats: the history still kept plus the totals the cleanup job archived when it deleted older matches. */

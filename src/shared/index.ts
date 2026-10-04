@@ -9,6 +9,7 @@ export * from './progression';
 export * from './protocol';
 export * from './rng';
 export * from './social';
+export * from './touchLayout';
 export * from './training';
 export * from './validation';
 export * from './zone';
